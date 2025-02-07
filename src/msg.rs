@@ -1,4 +1,3 @@
-// src/msg.rs
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -6,20 +5,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct InstantiateMsg {}
 
-/// Structure representing a stub for ImageInfo with fixed variables.
+/// Structure representing an image filter for attestation verification.
+/// Each field corresponds to a field in `tdx_quote_t` (except header) and is wrapped in Option,
+/// so the admin can specify only those fields that need to be checked.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct ImageInfo {
-    pub var1: String,
-    pub var2: String,
-    pub var3: String,
-}
-
-/// Structure representing a stub for attestation.
-/// Additional fields can be added as requirements are finalized.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct Attestation {
-    /// Placeholder for ephemeral key or report data used for encryption.
-    pub report_data: String,
+pub struct MsgImageFilter {
+    pub mr_seam: Option<Vec<u8>>,
+    pub mr_signer_seam: Option<Vec<u8>>,
+    pub mr_td: Option<Vec<u8>>,
+    pub mr_config_id: Option<Vec<u8>>,
+    pub mr_owner: Option<Vec<u8>>,
+    pub mr_config: Option<Vec<u8>>,
+    pub rtmr0: Option<Vec<u8>>,
+    pub rtmr1: Option<Vec<u8>>,
+    pub rtmr2: Option<Vec<u8>>,
+    pub rtmr3: Option<Vec<u8>>,
 }
 
 /// Execute messages for the contract.
@@ -28,14 +28,12 @@ pub struct Attestation {
 pub enum ExecuteMsg {
     /// CreateService creates a new service with the provided name.
     CreateService { name: String },
-    /// AddImageToService adds image info to a service.
+    /// AddImageToService adds an image filter (attestation parameters) to a service.
     /// Only the service admin can call this.
-    AddImageToService { service_id: u64, image_info: ImageInfo },
-    /// RemoveImageFromService removes image info from a service.
+    AddImageToService { service_id: u64, image_filter: MsgImageFilter },
+    /// RemoveImageFromService removes an image filter from a service.
     /// Only the service admin can call this.
-    RemoveImageFromService { service_id: u64, image_info: ImageInfo },
-    /// GetSecretKey returns the encrypted secret key if the attestation is valid.
-    GetSecretKey { service_id: u64, attestation: Attestation },
+    RemoveImageFromService { service_id: u64, image_filter: MsgImageFilter },
 }
 
 /// Query messages for the contract.
@@ -46,6 +44,9 @@ pub enum QueryMsg {
     GetService { id: u64 },
     /// ListServices returns a list of all services.
     ListServices {},
+    /// GetSecretKey returns the encrypted secret key for a service after verifying the provided quote and collateral.
+    /// It accepts two buffers: one for the quote and one for the collateral.
+    GetSecretKey { service_id: u64, quote: Vec<u8>, collateral: Vec<u8> },
 }
 
 /// Response for service queries.
@@ -54,4 +55,10 @@ pub struct ServiceResponse {
     pub id: u64,
     pub name: String,
     pub admin: String,
+}
+
+/// Response for GetSecretKey.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct SecretKeyResponse {
+    pub encrypted_secret_key: String,
 }

@@ -1,4 +1,3 @@
-// src/state.rs
 use cosmwasm_std::{Addr, StdResult, Storage};
 use cosmwasm_storage::{singleton, singleton_read, ReadonlySingleton, Singleton};
 use schemars::JsonSchema;
@@ -14,13 +13,21 @@ pub struct GlobalState {
     pub service_count: u64,
 }
 
-/// Structure representing a stub for ImageInfo with fixed variables.
-/// These fields are placeholders and may be changed as requirements are refined.
+/// Structure representing an image filter (attestation parameters) for a service.
+/// Fields correspond to those in `tdx_quote_t` (except header) and are wrapped in Option.
+/// Теперь поля имеют тип Option<Vec<u8>> для гибкости сравнения.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct ImageInfo {
-    pub var1: String,
-    pub var2: String,
-    pub var3: String,
+pub struct ImageFilter {
+    pub mr_seam: Option<Vec<u8>>,
+    pub mr_signer_seam: Option<Vec<u8>>,
+    pub mr_td: Option<Vec<u8>>,
+    pub mr_config_id: Option<Vec<u8>>,
+    pub mr_owner: Option<Vec<u8>>,
+    pub mr_config: Option<Vec<u8>>,
+    pub rtmr0: Option<Vec<u8>>,
+    pub rtmr1: Option<Vec<u8>>,
+    pub rtmr2: Option<Vec<u8>>,
+    pub rtmr3: Option<Vec<u8>>,
 }
 
 /// Structure representing a service.
@@ -32,10 +39,10 @@ pub struct Service {
     pub name: String,
     /// Address of the service admin (creator).
     pub admin: Addr,
-    /// Secret key for the service (placeholder, to be generated).
-    pub secret_key: Option<String>,
-    /// List of image information associated with the service (stub).
-    pub image_infos: Vec<ImageInfo>,
+    /// Secret key for the service.
+    pub secret_key: Vec<u8>,
+    /// List of image filters (permitted attestation parameters) associated with the service.
+    pub image_filters: Vec<ImageFilter>,
 }
 
 /// Returns a mutable singleton for the global state.
