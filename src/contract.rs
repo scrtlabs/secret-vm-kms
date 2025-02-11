@@ -2,11 +2,14 @@ use cosmwasm_std::{entry_point, to_binary, Binary, Deps, DepsMut, Env, MessageIn
 use sha2::{Digest, Sha256};
 use hex;
 use core::mem;
+#[cfg(feature = "backtraces")]
 use std::backtrace::Backtrace;
 use thiserror::Error;
 use crate::crypto::SIVEncryptable;
 use crate::msg::{ExecuteMsg, InstantiateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
 use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter};
+use crate::import_helpers::{from_high_half, from_low_half};
+use crate::memory::{build_region, Region};
 
 /// Declaration of tdx_quote_hdr_t and tdx_quote_t as provided.
 /// DO NOT CHANGE THIS CODE.
@@ -43,25 +46,73 @@ pub struct tdx_quote_t {
 }
 
 #[derive(Error, Debug)]
-pub enum SigningError {
+pub enum SigningErrorC {
     #[error("Invalid private key format")]
     InvalidPrivateKeyFormat,
     #[error("Unknown error: {error_code}")]
     UnknownErr {
         error_code: u32,
-        #[cfg(feature = "backtraces")]
+        #[cfg(all(feature = "backtraces", error_generic_member_access))]
         backtrace: Backtrace,
     },
 }
 
-/// Provided attestation verification functions (stubs). DO NOT CHANGE.
-fn dcap_quote_verify(
-    quote: &[u8],
-    collateral: &[u8]
-) -> Result<u32, SigningError>;
+/// Declare the external function provided by the VM/chain.
+///
+/// This function is expected to take two pointers:
+/// - `quote_ptr`: a pointer to a memory region containing the quote data.
+/// - `collateral_ptr`: a pointer to a memory region containing the collateral data.
+///
+/// It returns a 64-bit integer where:
+/// - The high half represents the error code.
+/// - The low half represents the verification result.
+extern "C" {
+    fn dcap_quote_verify(quote_ptr: u32, collateral_ptr: u32) -> u64;
+}
+
+/// Verifies a DCAP quote using an external function.
+///
+/// This function packs the input slices `quote` and `collateral` into memory regions,
+/// passes them to the external function, and decodes the result.
+///
+/// # Parameters
+///
+/// - `quote`: A byte slice containing the quote data.
+/// - `collateral`: A byte slice containing the collateral data.
+///
+/// # Returns
+///
+/// - `Ok(u32)` with the verification result (from the low half of the returned value)
+///   if the verification is successful (i.e., error code is 0).
+/// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
+fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
+    // Pack the input data into memory regions for FFI
+    let quote_region = build_region(quote);
+    let quote_ptr = &*quote_region as *const Region as u32;
+
+    let collateral_region = build_region(collateral);
+    let collateral_ptr = &*collateral_region as *const Region as u32;
+
+    // Call the external function to verify the DCAP quote
+    let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
+
+    // Decode the returned 64-bit value:
+    // - The high half is the error code.
+    // - The low half is the verification result.
+    let error_code = from_high_half(result);
+    let verify_result = from_low_half(result);
+
+    // Process the result based on the error code
+    match error_code {
+        0 => Ok(verify_result),
+        error_code => Err(SigningErrorC::UnknownErr {
+            error_code,
+        }),
+    }
+}
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
-    match dcap_quote_verify(quote, collateral) {
+    match dcap_quote_verify_internal(quote, collateral) {
         Ok(_qv_result) => {},
         Err(_) => {
             return None;

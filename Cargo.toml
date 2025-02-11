@@ -25,8 +25,9 @@ default = []
 backtraces = ["cosmwasm-std/backtraces"]
 
 [dependencies]
-cosmwasm-std = { package = "secret-cosmwasm-std", version = "1.1.10", features = ["random","backtraces"]}
+cosmwasm-std = { package = "secret-cosmwasm-std", version = "1.1.10", features = ["random"]}
 cosmwasm-storage = { package = "secret-cosmwasm-storage", version = "1.0.0" }
+getrandom = {version = "0.2.15", features = ["js"] }
 schemars = { version = "0.8.11" }
 serde = { version = "1.0" }
 thiserror = { version = "2.0.3" }
