@@ -5,7 +5,7 @@ use std::result;
 use aes_siv::aead::generic_array::GenericArray;
 use aes_siv::siv::Aes128Siv;
 use log::warn;
-use x25519_dalek;
+// use x25519_dalek;
 
 #[derive(Debug)]
 pub enum CryptoError {
