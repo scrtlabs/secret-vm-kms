@@ -294,6 +294,30 @@ pub fn try_remove_image(
     )
 }
 
+/// New helper function to encrypt the secret key using AES-SIV.
+/// It accepts a secret key (as a Vec<u8>) and a public key (a 32‑byte array),
+/// generates an ephemeral key pair, computes the shared secret via Diffie‑Hellman,
+/// and returns the encrypted secret key as a hex‑encoded string.
+fn encrypt_secret(secret_key: Vec<u8>, public_key: [u8; 32]) -> StdResult<String> {
+    // Generate an ephemeral key pair.
+    let kp = crate::crypto::KeyPair::new()
+        .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair"))?;
+
+    // Compute the Diffie-Hellman shared secret.
+    let shared_key = kp.diffie_hellman(&public_key);
+
+    // Create an AESKey from the shared secret.
+    let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
+
+    // Encrypt the secret key using AES-SIV with no additional data.
+    let encrypted_secret = aes_key
+        .encrypt_siv(&secret_key, None)
+        .map_err(|_| StdError::generic_err("Encryption failed"))?;
+
+    let encrypted_secret_key = hex::encode(encrypted_secret);
+    Ok(encrypted_secret_key)
+}
+
 /// Handles obtaining the secret key for a service.
 /// It receives two buffers (quote and collateral), parses the TDX attestation using the provided function,
 /// then iterates over stored image filters. For each filter, for every field that is Some,
@@ -385,32 +409,13 @@ pub fn try_get_secret_key(
         return Err(StdError::generic_err("Attestation parameters do not match any permitted image"));
     }
     let secret_key = service.secret_key;
-
-    // --- Begin encryption of the service secret key using AES-SIV ---
-    // Extract the first 32 bytes from the parsed report_data to serve as the "other" public key.
+    // Extract the first 32 bytes from report_data to serve as the "other" public key.
     let other_pub_key: [u8; 32] = tdx_quote.report_data[0..32]
         .try_into()
         .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
 
-    // Generate an ephemeral key pair. (Assumes KeyPair::new() is available in crate::keys)
-    let kp = crate::crypto::KeyPair::new()
-        .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair"))?;
-
-    // Compute the Diffie-Hellman shared secret.
-    let shared_key = kp.diffie_hellman(&other_pub_key);
-
-    // Create an AESKey from the shared secret.
-    let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
-
-    let secret_bytes = secret_key;
-
-    // Encrypt the secret key using AES-SIV with no additional data.
-    let encrypted_secret = aes_key
-        .encrypt_siv(&secret_bytes, None)
-        .map_err(|_| StdError::generic_err("Encryption failed"))?;
-    // --- End encryption ---
-
-    let encrypted_secret_key = hex::encode(encrypted_secret);
+    // Encrypt the service secret key using the new helper function.
+    let encrypted_secret_key = encrypt_secret(secret_key, other_pub_key)?;
     Ok(SecretKeyResponse { encrypted_secret_key })
 }
 
@@ -578,5 +583,23 @@ mod tests {
             },
             _ => panic!("Expected unauthorized error"),
         }
+    }
+
+    #[test]
+    fn test_encrypt_secret_function() {
+        // Use a dummy secret key.
+        let secret_key = b"dummy_secret_key".to_vec();
+        // Use a fixed public key (32 bytes).
+        let public_key: [u8; 32] = [1; 32];
+
+        // Call the encryption function.
+        let encrypted = encrypt_secret(secret_key, public_key).unwrap();
+
+        // Ensure that the encrypted string is not empty.
+        assert!(!encrypted.is_empty());
+
+        // Attempt to decode the hex string to verify the correct format.
+        let decoded = hex::decode(&encrypted).unwrap();
+        assert!(!decoded.is_empty());
     }
 }
