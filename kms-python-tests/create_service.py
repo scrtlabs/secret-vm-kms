@@ -1,4 +1,6 @@
 import json
+from time import sleep
+
 from secret_sdk.client.lcd import LCDClient
 from secret_sdk.key.mnemonic import MnemonicKey
 
@@ -24,7 +26,7 @@ contract_address = "secret17p5c96gksfwqtjnygrs0lghjw6n9gn6c804fdu"
 # This corresponds to the CreateService { name: String } variant.
 create_service_msg = {
     "create_service": {
-        "name": "TestService"
+        "name": "TestService11"
     }
 }
 
@@ -33,9 +35,13 @@ print(json.dumps(create_service_msg, indent=2))
 
 # Broadcast the execute message.
 # Note: You might need to adjust fees and gas parameters according to your chain.
-try:
-    tx_result = wallet.execute_tx(contract_address, create_service_msg)
-    print("Transaction result:")
-    print(json.dumps(tx_result, indent=2))
-except Exception as e:
-    print("Error executing contract:", e)
+t = wallet.execute_tx(contract_address, create_service_msg)
+print("Execute result:", t)
+
+sleep(10)
+
+tx_info = client.tx.tx_info(
+    tx_hash=t.txhash,
+)
+
+print("Transaction info:", tx_info)

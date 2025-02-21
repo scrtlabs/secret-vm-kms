@@ -1,5 +1,7 @@
 import json
 import os
+from time import sleep
+
 from secret_sdk.client.lcd import LCDClient
 from secret_sdk.key.mnemonic import MnemonicKey
 
@@ -56,9 +58,13 @@ contract_address = "secret17p5c96gksfwqtjnygrs0lghjw6n9gn6c804fdu"
 
 # Broadcast the execute message.
 # You may need to adjust fees and gas parameters based on your chain's requirements.
-try:
-    tx_result = wallet.execute_tx(contract_address, execute_msg)
-    print("Transaction result:")
-    print(json.dumps(tx_result, indent=2))
-except Exception as e:
-    print("Error executing contract:", e)
+t = wallet.execute_tx(contract_address, execute_msg)
+print("Execute result:", t)
+
+sleep(5)
+
+tx_info = client.tx.tx_info(
+    tx_hash=t.txhash,
+)
+
+print("Transaction info:", tx_info)

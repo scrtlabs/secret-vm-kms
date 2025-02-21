@@ -26,7 +26,7 @@ collateral = list(bytearray.fromhex(collateral_hex))
 # Construct the query message.
 query_msg = {
     "get_secret_key": {
-        "service_id": 0,
+        "service_id": 1,
         "quote": quote,
         "collateral": collateral,
     }
