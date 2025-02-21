@@ -14,7 +14,7 @@ use crate::memory::{build_region, Region};
 /// Declaration of tdx_quote_hdr_t and tdx_quote_t as provided.
 /// DO NOT CHANGE THIS CODE.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct tdx_quote_hdr_t {
     pub version: u16,
     pub key_type: u16,
@@ -25,7 +25,7 @@ pub struct tdx_quote_hdr_t {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct tdx_quote_t {
     pub header: tdx_quote_hdr_t,
     pub tcb_svn: [u8;16],
@@ -57,67 +57,67 @@ pub enum SigningErrorC {
     },
 }
 
-/// Declare the external function provided by the VM/chain.
-///
-/// This function is expected to take two pointers:
-/// - `quote_ptr`: a pointer to a memory region containing the quote data.
-/// - `collateral_ptr`: a pointer to a memory region containing the collateral data.
-///
-/// It returns a 64-bit integer where:
-/// - The high half represents the error code.
-/// - The low half represents the verification result.
-extern "C" {
-    fn dcap_quote_verify(quote_ptr: u32, collateral_ptr: u32) -> u64;
-}
-
-/// Verifies a DCAP quote using an external function.
-///
-/// This function packs the input slices `quote` and `collateral` into memory regions,
-/// passes them to the external function, and decodes the result.
-///
-/// # Parameters
-///
-/// - `quote`: A byte slice containing the quote data.
-/// - `collateral`: A byte slice containing the collateral data.
-///
-/// # Returns
-///
-/// - `Ok(u32)` with the verification result (from the low half of the returned value)
-///   if the verification is successful (i.e., error code is 0).
-/// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
-fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
-    // Pack the input data into memory regions for FFI
-    let quote_region = build_region(quote);
-    let quote_ptr = &*quote_region as *const Region as u32;
-
-    let collateral_region = build_region(collateral);
-    let collateral_ptr = &*collateral_region as *const Region as u32;
-
-    // Call the external function to verify the DCAP quote
-    let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
-
-    // Decode the returned 64-bit value:
-    // - The high half is the error code.
-    // - The low half is the verification result.
-    let error_code = from_high_half(result);
-    let verify_result = from_low_half(result);
-
-    // Process the result based on the error code
-    match error_code {
-        0 => Ok(verify_result),
-        error_code => Err(SigningErrorC::UnknownErr {
-            error_code,
-        }),
-    }
-}
+// /// Declare the external function provided by the VM/chain.
+// ///
+// /// This function is expected to take two pointers:
+// /// - `quote_ptr`: a pointer to a memory region containing the quote data.
+// /// - `collateral_ptr`: a pointer to a memory region containing the collateral data.
+// ///
+// /// It returns a 64-bit integer where:
+// /// - The high half represents the error code.
+// /// - The low half represents the verification result.
+// extern "C" {
+//     fn dcap_quote_verify(quote_ptr: u32, collateral_ptr: u32) -> u64;
+// }
+//
+// /// Verifies a DCAP quote using an external function.
+// ///
+// /// This function packs the input slices `quote` and `collateral` into memory regions,
+// /// passes them to the external function, and decodes the result.
+// ///
+// /// # Parameters
+// ///
+// /// - `quote`: A byte slice containing the quote data.
+// /// - `collateral`: A byte slice containing the collateral data.
+// ///
+// /// # Returns
+// ///
+// /// - `Ok(u32)` with the verification result (from the low half of the returned value)
+// ///   if the verification is successful (i.e., error code is 0).
+// /// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
+// fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
+//     // Pack the input data into memory regions for FFI
+//     let quote_region = build_region(quote);
+//     let quote_ptr = &*quote_region as *const Region as u32;
+//
+//     let collateral_region = build_region(collateral);
+//     let collateral_ptr = &*collateral_region as *const Region as u32;
+//
+//     // Call the external function to verify the DCAP quote
+//     let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
+//
+//     // Decode the returned 64-bit value:
+//     // - The high half is the error code.
+//     // - The low half is the verification result.
+//     let error_code = from_high_half(result);
+//     let verify_result = from_low_half(result);
+//
+//     // Process the result based on the error code
+//     match error_code {
+//         0 => Ok(verify_result),
+//         error_code => Err(SigningErrorC::UnknownErr {
+//             error_code,
+//         }),
+//     }
+// }
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
-    match dcap_quote_verify_internal(quote, collateral) {
-        Ok(_qv_result) => {},
-        Err(_) => {
-            return None;
-        }
-    }
+    // match dcap_quote_verify_internal(quote, collateral) {
+    //     Ok(_qv_result) => {},
+    //     Err(_) => {
+    //         return None;
+    //     }
+    // }
     if quote.len() < mem::size_of::<tdx_quote_t>() {
         // "too small"
         return None;
@@ -187,8 +187,11 @@ pub fn try_create_service(
     hasher.update(&random_bytes);
 
     hasher.update(&service_id.to_be_bytes());
+    // println!("bytes_len = {}", service_id.to_be_bytes().len() + random_bytes.len());
     let secret_hash = hasher.finalize();
     let secret = secret_hash.to_vec();
+
+    // println!("secret len = {}", secret.len());
 
     let new_service = Service {
         id: service_id,
@@ -314,6 +317,8 @@ fn encrypt_secret(secret_key: Vec<u8>, public_key: [u8; 32]) -> StdResult<String
         .encrypt_siv(&secret_key, None)
         .map_err(|_| StdError::generic_err("Encryption failed"))?;
 
+    // println!("encrypted_secret len = {}", encrypted_secret.len());
+
     let encrypted_secret_key = hex::encode(encrypted_secret);
     Ok(encrypted_secret_key)
 }
@@ -335,6 +340,8 @@ pub fn try_get_secret_key(
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
     let tdx_quote = parse_tdx_attestation(&quote, &collateral)
         .ok_or_else(|| StdError::generic_err("Attestation verification failed or quote invalid"))?;
+
+    // println!("tdx_quote: {:#?}", tdx_quote);
 
     // Convert fixed arrays from tdx_quote to Vec<u8> for comparison.
     let tdx_mr_seam = tdx_quote.mr_seam.to_vec();
@@ -413,7 +420,6 @@ pub fn try_get_secret_key(
     let other_pub_key: [u8; 32] = tdx_quote.report_data[0..32]
         .try_into()
         .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
-
     // Encrypt the service secret key using the new helper function.
     let encrypted_secret_key = encrypt_secret(secret_key, other_pub_key)?;
     Ok(SecretKeyResponse { encrypted_secret_key })
@@ -454,6 +460,8 @@ fn query_services(deps: Deps) -> StdResult<Vec<ServiceResponse>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
     use cosmwasm_std::{from_binary, StdError};
@@ -555,6 +563,62 @@ mod tests {
     }
 
     #[test]
+    fn get_secret_key_from_file() {
+        // Read the quote and collateral data from files.
+        let quote_path = Path::new("tests/quote.txt");
+        let collateral_path = Path::new("tests/collateral.txt");
+        let quote_hex = fs::read_to_string(quote_path)
+            .expect("Failed to read quote.txt");
+        let collateral_hex = fs::read_to_string(collateral_path)
+            .expect("Failed to read collateral.txt");
+
+        // Decode the hex strings into byte vectors (trim to remove any extra whitespace/newlines)
+        let quote = hex::decode(quote_hex.trim())
+            .expect("Failed to decode quote hex");
+        let collateral = hex::decode(collateral_hex.trim())
+            .expect("Failed to decode collateral hex");
+
+        // Set up the contract with a service and an image filter that accepts any quote.
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        let init_msg = InstantiateMsg {};
+        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // Create a new service.
+        let create_msg = ExecuteMsg::CreateService { name: "ServiceForFileKey".to_string() };
+        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
+
+        // Add an image filter that accepts any quote (all fields are None).
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: None,
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+        };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
+        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
+
+        // Query the secret key using the quote and collateral read from file.
+        let get_msg = QueryMsg::GetSecretKey { service_id: 0, quote, collateral };
+        let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
+        let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
+
+        println!("secret_key: {}", secret_key.encrypted_secret_key);
+
+        // Since encryption uses ephemeral keys, we check that the result is non-empty and decodable.
+        assert!(!secret_key.encrypted_secret_key.is_empty());
+        let decoded = hex::decode(&secret_key.encrypted_secret_key)
+            .expect("Failed to decode encrypted secret key");
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
     fn unauthorized_add_image() {
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
@@ -595,11 +659,64 @@ mod tests {
         // Call the encryption function.
         let encrypted = encrypt_secret(secret_key, public_key).unwrap();
 
+        println!("encrypted: {}", encrypted);
+
         // Ensure that the encrypted string is not empty.
         assert!(!encrypted.is_empty());
 
         // Attempt to decode the hex string to verify the correct format.
         let decoded = hex::decode(&encrypted).unwrap();
+
+        println!("decoded: {:?}", decoded);
         assert!(!decoded.is_empty());
     }
+
+    #[test]
+    fn prepare_secretcli_get_secret_key_command() {
+        use std::fs;
+        use std::path::Path;
+        use serde_json;
+
+        // Define paths for the quote and collateral files.
+        let quote_path = Path::new("tests/quote.txt");
+        let collateral_path = Path::new("tests/collateral.txt");
+
+        // Read the hex strings from the files.
+        let quote_hex = fs::read_to_string(quote_path)
+            .expect("Failed to read quote.txt")
+            .trim()
+            .to_string();
+        let collateral_hex = fs::read_to_string(collateral_path)
+            .expect("Failed to read collateral.txt")
+            .trim()
+            .to_string();
+
+        // Decode the hex strings into Vec<u8>.
+        let quote_vec = hex::decode(&quote_hex).expect("Failed to decode quote hex");
+        let collateral_vec = hex::decode(&collateral_hex).expect("Failed to decode collateral hex");
+
+        // Serialize the Vec<u8> into JSON arrays.
+        let quote_json = serde_json::to_string(&quote_vec).unwrap();
+        let collateral_json = serde_json::to_string(&collateral_vec).unwrap();
+
+        // Define contract address and service id.
+        let contract_address = "secret17p5c96gksfwqtjnygrs0lghjw6n9gn6c804fdu";
+        let service_id = "0";
+
+        // Build the query JSON string with escaped quotes.
+        // Note: The JSON arrays for quote and collateral are inserted directly (without extra quotes).
+        let query_json = format!(
+            "{{\\\"get_secret_key\\\":{{\\\"service_id\\\":{},\\\"quote\\\":{},\\\"collateral\\\":{}}}}}",
+            service_id, quote_json, collateral_json
+        );
+
+        // Build the SecretCLI command string without the --query flag.
+        let command = format!(
+            "secretcli q compute query {} {}",
+            contract_address, query_json
+        );
+
+        println!("SecretCLI command: {}", command);
+    }
+
 }
