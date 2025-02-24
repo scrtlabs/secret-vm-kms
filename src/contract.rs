@@ -345,7 +345,7 @@ fn encrypt_secret(
         .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair with seed"))?;
 
     // Compute shared secret using the provided other_pub_key.
-    let shared_key = kp.diffie_hellman(&kp.get_pubkey());
+    let shared_key = kp.diffie_hellman(&other_pub_key);
     let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
     let encrypted = aes_key
         .encrypt_siv(&service_secret_key, None)
