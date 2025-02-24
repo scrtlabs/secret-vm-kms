@@ -113,12 +113,12 @@ fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, Si
 }
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
-    // match dcap_quote_verify_internal(quote, collateral) {
-    //     Ok(_qv_result) => {},
-    //     Err(_) => {
-    //         return None;
-    //     }
-    // }
+    match dcap_quote_verify_internal(quote, collateral) {
+        Ok(_qv_result) => {},
+        Err(_) => {
+            return None;
+        }
+    }
     if quote.len() < mem::size_of::<tdx_quote_t>() {
         // "too small"
         return None;
@@ -345,7 +345,7 @@ fn encrypt_secret(
         .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair with seed"))?;
 
     // Compute shared secret using the provided other_pub_key.
-    let shared_key = kp.diffie_hellman(&other_pub_key);
+    let shared_key = kp.diffie_hellman(&kp.get_pubkey());
     let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
     let encrypted = aes_key
         .encrypt_siv(&service_secret_key, None)
@@ -355,7 +355,7 @@ fn encrypt_secret(
     Ok(SecretKeyResponse {
         encrypted_secret_key,
         // Also return the ephemeral public key (hex‑encoded)
-        encryption_pub_key: hex::encode(other_pub_key),
+        encryption_pub_key: hex::encode(kp.get_pubkey()),
     })
 }
 
