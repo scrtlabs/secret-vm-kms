@@ -49,6 +49,14 @@ pub enum QueryMsg {
     GetSecretKey { service_id: u64, quote: Vec<u8>, collateral: Vec<u8> },
 }
 
+/// Migrate message enum for contract migration
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrateMsg {
+    Migrate {},
+    StdError {},
+}
+
 /// Response for service queries.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct ServiceResponse {
@@ -61,4 +69,5 @@ pub struct ServiceResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct SecretKeyResponse {
     pub encrypted_secret_key: String,
+    pub encryption_pub_key: String, // new field to return the public key used in encryption
 }

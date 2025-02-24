@@ -5,6 +5,7 @@ use std::result;
 use aes_siv::aead::generic_array::GenericArray;
 use aes_siv::siv::Aes128Siv;
 use log::warn;
+use sha2::{Digest, Sha256};
 // use x25519_dalek;
 
 #[derive(Debug)]
@@ -154,6 +155,21 @@ pub fn rand_slice(rand: &mut [u8]) -> Result<(), CryptoError> {
     rsgx_read_rand(rand).map_err(|_e| CryptoError::RandomError {})
 }
 
+/// New helper: a deterministic rand_slice which fills `rand` using a given seed.
+/// It repeatedly hashes the current value to generate enough pseudorandom bytes.
+pub fn rand_slice_with_seed(rand: &mut [u8], seed: &[u8]) -> Result<(), CryptoError> {
+    let mut current = seed.to_vec();
+    let mut offset = 0;
+    while offset < rand.len() {
+        let hash = Sha256::digest(&current);
+        let bytes_to_copy = std::cmp::min(rand.len() - offset, hash.len());
+        rand[offset..offset + bytes_to_copy].copy_from_slice(&hash[..bytes_to_copy]);
+        offset += bytes_to_copy;
+        current = hash.to_vec();
+    }
+    Ok(())
+}
+
 pub const SECRET_KEY_SIZE: usize = 32;
 pub const PUBLIC_KEY_SIZE: usize = 32;
 pub const SGX_ECP256_KEY_SIZE: usize = 32;
@@ -214,6 +230,19 @@ impl KeyPair {
         let sk = x25519_dalek::StaticSecret::from(secret_key.to_owned().key.r as [u8; 32]);
         let pk = x25519_dalek::PublicKey::from(&sk);
 
+        Ok(Self {
+            secret_key,
+            public_key: *pk.as_bytes(),
+        })
+    }
+    /// Create a new key pair using the provided seed.
+    /// The seed is used to fill the secret key deterministically.
+    pub fn new_with_seed(seed: [u8; SECRET_KEY_SIZE]) -> Result<Self, CryptoError> {
+        let mut secret_key = Ed25519PrivateKey::default();
+        // Instead of using SGX randomness, fill secret_key using the given seed.
+        rand_slice_with_seed(secret_key.get_mut(), &seed)?;
+        let sk = x25519_dalek::StaticSecret::from(*secret_key.get_mut());
+        let pk = x25519_dalek::PublicKey::from(&sk);
         Ok(Self {
             secret_key,
             public_key: *pk.as_bytes(),

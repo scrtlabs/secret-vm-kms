@@ -4,9 +4,10 @@ use hex;
 use core::mem;
 #[cfg(feature = "backtraces")]
 use std::backtrace::Backtrace;
+use sha2::digest::Update;
 use thiserror::Error;
-use crate::crypto::SIVEncryptable;
-use crate::msg::{ExecuteMsg, InstantiateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
+use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
+use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
 use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
@@ -57,59 +58,59 @@ pub enum SigningErrorC {
     },
 }
 
-// /// Declare the external function provided by the VM/chain.
-// ///
-// /// This function is expected to take two pointers:
-// /// - `quote_ptr`: a pointer to a memory region containing the quote data.
-// /// - `collateral_ptr`: a pointer to a memory region containing the collateral data.
-// ///
-// /// It returns a 64-bit integer where:
-// /// - The high half represents the error code.
-// /// - The low half represents the verification result.
-// extern "C" {
-//     fn dcap_quote_verify(quote_ptr: u32, collateral_ptr: u32) -> u64;
-// }
-//
-// /// Verifies a DCAP quote using an external function.
-// ///
-// /// This function packs the input slices `quote` and `collateral` into memory regions,
-// /// passes them to the external function, and decodes the result.
-// ///
-// /// # Parameters
-// ///
-// /// - `quote`: A byte slice containing the quote data.
-// /// - `collateral`: A byte slice containing the collateral data.
-// ///
-// /// # Returns
-// ///
-// /// - `Ok(u32)` with the verification result (from the low half of the returned value)
-// ///   if the verification is successful (i.e., error code is 0).
-// /// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
-// fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
-//     // Pack the input data into memory regions for FFI
-//     let quote_region = build_region(quote);
-//     let quote_ptr = &*quote_region as *const Region as u32;
-//
-//     let collateral_region = build_region(collateral);
-//     let collateral_ptr = &*collateral_region as *const Region as u32;
-//
-//     // Call the external function to verify the DCAP quote
-//     let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
-//
-//     // Decode the returned 64-bit value:
-//     // - The high half is the error code.
-//     // - The low half is the verification result.
-//     let error_code = from_high_half(result);
-//     let verify_result = from_low_half(result);
-//
-//     // Process the result based on the error code
-//     match error_code {
-//         0 => Ok(verify_result),
-//         error_code => Err(SigningErrorC::UnknownErr {
-//             error_code,
-//         }),
-//     }
-// }
+/// Declare the external function provided by the VM/chain.
+///
+/// This function is expected to take two pointers:
+/// - `quote_ptr`: a pointer to a memory region containing the quote data.
+/// - `collateral_ptr`: a pointer to a memory region containing the collateral data.
+///
+/// It returns a 64-bit integer where:
+/// - The high half represents the error code.
+/// - The low half represents the verification result.
+extern "C" {
+    fn dcap_quote_verify(quote_ptr: u32, collateral_ptr: u32) -> u64;
+}
+
+/// Verifies a DCAP quote using an external function.
+///
+/// This function packs the input slices `quote` and `collateral` into memory regions,
+/// passes them to the external function, and decodes the result.
+///
+/// # Parameters
+///
+/// - `quote`: A byte slice containing the quote data.
+/// - `collateral`: A byte slice containing the collateral data.
+///
+/// # Returns
+///
+/// - `Ok(u32)` with the verification result (from the low half of the returned value)
+///   if the verification is successful (i.e., error code is 0).
+/// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
+fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
+    // Pack the input data into memory regions for FFI
+    let quote_region = build_region(quote);
+    let quote_ptr = &*quote_region as *const Region as u32;
+
+    let collateral_region = build_region(collateral);
+    let collateral_ptr = &*collateral_region as *const Region as u32;
+
+    // Call the external function to verify the DCAP quote
+    let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
+
+    // Decode the returned 64-bit value:
+    // - The high half is the error code.
+    // - The low half is the verification result.
+    let error_code = from_high_half(result);
+    let verify_result = from_low_half(result);
+
+    // Process the result based on the error code
+    match error_code {
+        0 => Ok(verify_result),
+        error_code => Err(SigningErrorC::UnknownErr {
+            error_code,
+        }),
+    }
+}
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
     // match dcap_quote_verify_internal(quote, collateral) {
@@ -129,6 +130,27 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
         None
     } else {
         Some(tdx_quote)
+    }
+}
+
+#[entry_point]
+pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
+    match msg {
+        MigrateMsg::Migrate {} => {
+            // // Iterate through all API keys and remove them
+            // let keys_to_remove: Vec<String> = API_KEY_MAP
+            //     .iter_keys(deps.storage)?
+            //     .filter_map(|key_result| key_result.ok())
+            //     .collect();
+            //
+            // for key in keys_to_remove {
+            //     API_KEY_MAP.remove(deps.storage, &key)?;
+            // }
+
+            Ok(Response::new()
+                .add_attribute("action", "migrate"))
+        }
+        MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
 }
 
@@ -168,6 +190,7 @@ pub fn execute(
 
 /// Handles creating a new service.
 /// Generates secret_key as SHA256(env.block.random + service_id) in hex.
+/// Handles creating a new service (unchanged aside from uniqueness check, if needed).
 pub fn try_create_service(
     deps: DepsMut,
     env: Env,
@@ -176,22 +199,22 @@ pub fn try_create_service(
 ) -> StdResult<Response> {
     let mut gs = global_state(deps.storage).load()?;
     let mut svc_list = services(deps.storage).load()?;
+
+    // Enforce unique service names.
+    if svc_list.iter().any(|s| s.name == name) {
+        return Err(StdError::generic_err("Service name already exists"));
+    }
+
     let service_id = gs.service_count;
-
     let mut hasher = Sha256::new();
-
     let mut random_bytes = Vec::new();
     for bin in env.block.random.iter() {
         random_bytes.extend_from_slice(bin.as_slice());
     }
-    hasher.update(&random_bytes);
-
-    hasher.update(&service_id.to_be_bytes());
-    // println!("bytes_len = {}", service_id.to_be_bytes().len() + random_bytes.len());
+    sha2::Digest::update(&mut hasher, &random_bytes);
+    sha2::Digest::update(&mut hasher, &service_id.to_be_bytes());
     let secret_hash = hasher.finalize();
     let secret = secret_hash.to_vec();
-
-    // println!("secret len = {}", secret.len());
 
     let new_service = Service {
         id: service_id,
@@ -301,26 +324,39 @@ pub fn try_remove_image(
 /// It accepts a secret key (as a Vec<u8>) and a public key (a 32‑byte array),
 /// generates an ephemeral key pair, computes the shared secret via Diffie‑Hellman,
 /// and returns the encrypted secret key as a hex‑encoded string.
-fn encrypt_secret(secret_key: Vec<u8>, public_key: [u8; 32]) -> StdResult<String> {
-    // Generate an ephemeral key pair.
-    let kp = crate::crypto::KeyPair::new()
-        .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair"))?;
+fn encrypt_secret(
+    service_secret_key: Vec<u8>,
+    other_pub_key: [u8; 32],
+    quote: &[u8],
+    height: Vec<u8>,
+) -> StdResult<SecretKeyResponse> {
+    // Compute seed = SHA256(service_secret_key || quote || other_pub_key || quote)
+    let mut hasher = Sha256::new();
+    sha2::Digest::update(&mut hasher, quote);
+    sha2::Digest::update(&mut hasher, &other_pub_key);
+    sha2::Digest::update(&mut hasher, &service_secret_key);
+    sha2::Digest::update(&mut hasher, &height);
+    let seed_hash = hasher.finalize();
+    let mut seed = [0u8; SECRET_KEY_SIZE];
+    seed.copy_from_slice(&seed_hash[..]);
 
-    // Compute the Diffie-Hellman shared secret.
-    let shared_key = kp.diffie_hellman(&public_key);
+    // Create ephemeral key pair using the computed seed.
+    let kp = KeyPair::new_with_seed(seed)
+        .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair with seed"))?;
 
-    // Create an AESKey from the shared secret.
+    // Compute shared secret using the provided other_pub_key.
+    let shared_key = kp.diffie_hellman(&other_pub_key);
     let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
-
-    // Encrypt the secret key using AES-SIV with no additional data.
-    let encrypted_secret = aes_key
-        .encrypt_siv(&secret_key, None)
+    let encrypted = aes_key
+        .encrypt_siv(&service_secret_key, None)
         .map_err(|_| StdError::generic_err("Encryption failed"))?;
+    let encrypted_secret_key = hex::encode(encrypted);
 
-    // println!("encrypted_secret len = {}", encrypted_secret.len());
-
-    let encrypted_secret_key = hex::encode(encrypted_secret);
-    Ok(encrypted_secret_key)
+    Ok(SecretKeyResponse {
+        encrypted_secret_key,
+        // Also return the ephemeral public key (hex‑encoded)
+        encryption_pub_key: hex::encode(other_pub_key),
+    })
 }
 
 /// Handles obtaining the secret key for a service.
@@ -331,6 +367,7 @@ fn encrypt_secret(secret_key: Vec<u8>, public_key: [u8; 32]) -> StdResult<String
 /// and returned.
 pub fn try_get_secret_key(
     deps: Deps,
+    env: Env,
     service_id: u64,
     quote: Vec<u8>,
     collateral: Vec<u8>,
@@ -421,17 +458,17 @@ pub fn try_get_secret_key(
         .try_into()
         .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
     // Encrypt the service secret key using the new helper function.
-    let encrypted_secret_key = encrypt_secret(secret_key, other_pub_key)?;
-    Ok(SecretKeyResponse { encrypted_secret_key })
+    let encrypted_secret_key_response = encrypt_secret(secret_key, other_pub_key,quote.as_slice(),env.block.height.to_string().into_bytes())?;
+    Ok(encrypted_secret_key_response)
 }
 
 /// Query entry point for handling QueryMsg.
 #[entry_point]
-pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetService { id } => to_binary(&query_service(deps, id)?),
         QueryMsg::ListServices {} => to_binary(&query_services(deps)?),
-        QueryMsg::GetSecretKey { service_id, quote, collateral } => to_binary(&try_get_secret_key(deps, service_id, quote, collateral)?),
+        QueryMsg::GetSecretKey { service_id, quote, collateral } => to_binary(&try_get_secret_key(deps,env, service_id, quote, collateral)?),
     }
 }
 
@@ -609,6 +646,7 @@ mod tests {
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
 
+        println!("secret_key: {:#?}", secret_key);
         println!("secret_key: {}", secret_key.encrypted_secret_key);
 
         // Since encryption uses ephemeral keys, we check that the result is non-empty and decodable.
@@ -657,15 +695,15 @@ mod tests {
         let public_key: [u8; 32] = [1; 32];
 
         // Call the encryption function.
-        let encrypted = encrypt_secret(secret_key, public_key).unwrap();
+        let encrypted = encrypt_secret(secret_key, public_key, "test".to_string().as_bytes(), "52".to_string().into_bytes()).unwrap();
 
-        println!("encrypted: {}", encrypted);
+        println!("encrypted: {:?}", encrypted);
 
         // Ensure that the encrypted string is not empty.
-        assert!(!encrypted.is_empty());
+        assert!(!encrypted.encrypted_secret_key.is_empty());
 
         // Attempt to decode the hex string to verify the correct format.
-        let decoded = hex::decode(&encrypted).unwrap();
+        let decoded = hex::decode(&encrypted.encrypted_secret_key).unwrap();
 
         println!("decoded: {:?}", decoded);
         assert!(!decoded.is_empty());
