@@ -8,7 +8,7 @@ use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
 use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 
@@ -136,19 +136,14 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
-        MigrateMsg::Migrate {} => {
-            // // Iterate through all API keys and remove them
-            // let keys_to_remove: Vec<String> = API_KEY_MAP
-            //     .iter_keys(deps.storage)?
-            //     .filter_map(|key_result| key_result.ok())
-            //     .collect();
-            //
-            // for key in keys_to_remove {
-            //     API_KEY_MAP.remove(deps.storage, &key)?;
-            // }
-
+        MigrateMsg::Migrate { admin } => {
+            // Load the current global state, update the admin, and save it.
+            let mut gs = global_state(deps.storage).load()?;
+            gs.admin = deps.api.addr_validate(&admin)?;
+            global_state(deps.storage).save(&gs)?;
             Ok(Response::new()
-                .add_attribute("action", "migrate"))
+                .add_attribute("action", "migrate")
+                .add_attribute("admin", gs.admin.to_string()))
         }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -159,13 +154,17 @@ pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response>
 pub fn instantiate(
     deps: DepsMut,
     _env: Env,
-    _info: MessageInfo,
+    info: MessageInfo,
     _msg: InstantiateMsg,
 ) -> StdResult<Response> {
-    let gs = GlobalState { service_count: 0 };
+    let gs = GlobalState {
+        service_count: 0,
+        admin: info.sender.clone(), // set the global admin to the sender
+    };
     global_state(deps.storage).save(&gs)?;
     let svc_list: Vec<Service> = Vec::new();
     services(deps.storage).save(&svc_list)?;
+    // Also initialize the bucket for image secret keys (nothing to store initially)
     Ok(Response::default())
 }
 
@@ -185,7 +184,58 @@ pub fn execute(
         ExecuteMsg::RemoveImageFromService { service_id, image_filter } => {
             try_remove_image(deps, info, service_id, image_filter)
         }
+        ExecuteMsg::AddSecretKeyByImage { image_filter } => {
+            try_add_secret_key_by_image(deps, env, info, image_filter)
+        }
     }
+}
+
+pub fn try_add_secret_key_by_image(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    image_filter: MsgImageFilter,
+) -> StdResult<Response> {
+    // Ensure the sender is the global admin.
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only the contract admin can add a secret key by image"));
+    }
+    // Serialize the image filter (as provided) and compute its hash.
+    let image_filter_serialized = serde_json::to_vec(&image_filter)
+        .map_err(|_| StdError::generic_err("Failed to serialize image filter"))?;
+    let mut hasher = Sha256::new();
+    // Use the image filter serialization (you could also include extra image field data if needed)
+    sha2::Digest::update(&mut hasher, &image_filter_serialized);
+    let image_hash = hasher.finalize();
+    let image_key = image_hash.to_vec();
+
+    // Access the separate bucket for image secret keys.
+    let mut bucket = image_secret_keys(deps.storage);
+    if bucket.load(&image_key).is_ok() {
+        return Ok(Response::new()
+            .add_attribute("action", "add_secret_key_by_image")
+            .add_attribute("message", "Secret key for this image already exists"));
+    }
+
+    // Create a new secret key for the image using env.block.random (same as in service creation).
+    let mut key_hasher = Sha256::new();
+    let mut random_bytes = Vec::new();
+    // Use the block random to create a seed (just like in try_create_service)
+    for bin in env.block.random.iter() {
+        random_bytes.extend_from_slice(bin.as_slice());
+    }
+    // Incorporate the random bytes and image data (e.g., the serialized image filter) into the seed.
+    sha2::Digest::update(&mut key_hasher, &random_bytes);
+    sha2::Digest::update(&mut key_hasher, &image_filter_serialized);
+    let new_secret = key_hasher.finalize().to_vec();
+
+    // Store the new secret key (unencrypted, as a hex string) in the bucket.
+    bucket.save(&image_key, &hex::encode(new_secret.clone()))?;
+
+    Ok(Response::new()
+        .add_attribute("action", "add_secret_key_by_image")
+        .add_attribute("message", "Secret key created for the image"))
 }
 
 /// Handles creating a new service.
@@ -462,13 +512,68 @@ pub fn try_get_secret_key(
     Ok(encrypted_secret_key_response)
 }
 
+pub fn try_get_secret_key_by_image(
+    deps: Deps,
+    env: Env,
+    quote: Vec<u8>,
+    collateral: Vec<u8>,
+) -> StdResult<SecretKeyResponse> {
+    // Parse the attestation.
+    let tdx_quote = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Attestation verification failed or quote invalid"))?;
+    // Reconstruct a minimal image filter from tdx_quote fields.
+    let image_filter = MsgImageFilter {
+        mr_seam: Some(tdx_quote.mr_seam.to_vec()),
+        mr_signer_seam: Some(tdx_quote.mr_signer_seam.to_vec()),
+        mr_td: Some(tdx_quote.mr_td.to_vec()),
+        mr_config_id: Some(tdx_quote.mr_config_id.to_vec()),
+        mr_owner: Some(tdx_quote.mr_owner.to_vec()),
+        mr_config: Some(tdx_quote.mr_config.to_vec()),
+        rtmr0: Some(tdx_quote.rtmr0.to_vec()),
+        rtmr1: Some(tdx_quote.rtmr1.to_vec()),
+        rtmr2: Some(tdx_quote.rtmr2.to_vec()),
+        rtmr3: Some(tdx_quote.rtmr3.to_vec()),
+    };
+    let image_filter_serialized = serde_json::to_vec(&image_filter)
+        .map_err(|_| StdError::generic_err("Failed to serialize image filter"))?;
+    let mut hasher = Sha256::new();
+    sha2::Digest::update(&mut hasher, &image_filter_serialized);
+    let image_hash = hasher.finalize();
+    let image_key = image_hash.to_vec();
+
+    let bucket = image_secret_keys_read(deps.storage);
+    let stored_secret_hex = bucket
+        .load(&image_key)
+        .map_err(|_| StdError::generic_err("Secret key for this image has not been created"))?;
+    // Convert stored secret key back to bytes.
+    let stored_secret = hex::decode(stored_secret_hex)
+        .map_err(|_| StdError::generic_err("Failed to decode stored secret key"))?;
+
+    // Extract the "other" public key from report_data.
+    let other_pub_key: [u8; 32] = tdx_quote.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
+    // Use env.block.height as height.
+    let height_bytes = env.block.height.to_string().into_bytes();
+
+    // Encrypt the stored secret key using the same encryption procedure.
+    let response = encrypt_secret(stored_secret, other_pub_key, &quote, height_bytes)?;
+    Ok(response)
+}
+
+
 /// Query entry point for handling QueryMsg.
 #[entry_point]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetService { id } => to_binary(&query_service(deps, id)?),
         QueryMsg::ListServices {} => to_binary(&query_services(deps)?),
-        QueryMsg::GetSecretKey { service_id, quote, collateral } => to_binary(&try_get_secret_key(deps,env, service_id, quote, collateral)?),
+        QueryMsg::GetSecretKey { service_id, quote, collateral } => {
+            to_binary(&try_get_secret_key(deps, env.clone(), service_id, quote, collateral)?)
+        }
+        QueryMsg::GetSecretKeyByImage { quote, collateral } => {
+            to_binary(&try_get_secret_key_by_image(deps, env, quote, collateral)?)
+        }
     }
 }
 
@@ -684,6 +789,126 @@ mod tests {
                 assert_eq!(msg, "Only the service admin can add image filter");
             },
             _ => panic!("Expected unauthorized error"),
+        }
+    }
+
+    #[test]
+    fn add_and_get_secret_key_by_image() {
+        use std::fs;
+        use std::path::Path;
+        use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+        use cosmwasm_std::{from_binary, StdError};
+
+        // Initialize dependencies and create the contract with an admin.
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        let init_msg = InstantiateMsg {};
+        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // --- Step 1. Read quote and collateral from files.
+        // (Assumes you have tests/quote.txt and tests/collateral.txt with valid hex strings.)
+        let quote_path = Path::new("tests/quote.txt");
+        let collateral_path = Path::new("tests/collateral.txt");
+        let quote_hex = fs::read_to_string(quote_path)
+            .expect("Failed to read quote.txt")
+            .trim()
+            .to_string();
+        let collateral_hex = fs::read_to_string(collateral_path)
+            .expect("Failed to read collateral.txt")
+            .trim()
+            .to_string();
+        let quote = hex::decode(&quote_hex).expect("Failed to decode quote hex");
+        let collateral = hex::decode(&collateral_hex).expect("Failed to decode collateral hex");
+
+        // --- Step 2. Reconstruct the image filter from the attestation.
+        // (This follows the same logic as in try_get_secret_key_by_image.)
+        let tdx_quote = parse_tdx_attestation(&quote, &collateral)
+            .expect("Attestation verification failed or quote invalid");
+        let image_filter = MsgImageFilter {
+            mr_seam: Some(tdx_quote.mr_seam.to_vec()),
+            mr_signer_seam: Some(tdx_quote.mr_signer_seam.to_vec()),
+            mr_td: Some(tdx_quote.mr_td.to_vec()),
+            mr_config_id: Some(tdx_quote.mr_config_id.to_vec()),
+            mr_owner: Some(tdx_quote.mr_owner.to_vec()),
+            mr_config: Some(tdx_quote.mr_config.to_vec()),
+            rtmr0: Some(tdx_quote.rtmr0.to_vec()),
+            rtmr1: Some(tdx_quote.rtmr1.to_vec()),
+            rtmr2: Some(tdx_quote.rtmr2.to_vec()),
+            rtmr3: Some(tdx_quote.rtmr3.to_vec()),
+        };
+
+        // --- Step 3. Execute AddSecretKeyByImage to store a secret key for this image.
+        let add_secret_msg = ExecuteMsg::AddSecretKeyByImage { image_filter: image_filter.clone() };
+        let add_response = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_secret_msg).unwrap();
+        assert!(add_response.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_secret_key_by_image"));
+
+        // --- Step 4. Query GetSecretKeyByImage.
+        let query_msg = QueryMsg::GetSecretKeyByImage { quote: quote.clone(), collateral: collateral.clone() };
+        let query_response_bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let secret_key_response: SecretKeyResponse = from_binary(&query_response_bin).unwrap();
+
+        // Check that we got a non-empty encrypted secret key and a public key.
+        assert!(!secret_key_response.encrypted_secret_key.is_empty());
+        assert!(!secret_key_response.encryption_pub_key.is_empty());
+
+        println!("Encrypted secret key: {}", secret_key_response.encrypted_secret_key);
+        println!("Encryption public key: {}", secret_key_response.encryption_pub_key);
+    }
+
+    #[test]
+    fn get_secret_key_by_image_without_adding() {
+        use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+
+        // Initialize dependencies and instantiate the contract.
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        let init_msg = InstantiateMsg {};
+        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // Create a dummy quote of the proper length.
+        let quote_len = mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len];
+
+        // Set header fields to satisfy parse_tdx_attestation:
+        // The header layout is: version (u16), key_type (u16), tee_type (u32), reserved (u32), qe_vendor_id ([u8;16]), user_data ([u8;20]).
+        // We'll set version = 4 and tee_type = 0x81.
+        // Assume little-endian encoding.
+        quote[0] = 4;  // version low byte
+        quote[1] = 0;  // version high byte
+
+        // key_type can remain 0.
+        // Set tee_type = 0x81 (129) as a u32 in little endian:
+        quote[4] = 129; // 0x81
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
+
+        // (Other header fields remain zero; that is acceptable for this dummy test.)
+
+        // Now, set the report_data field (the last 64 bytes of the quote)
+        // so that the first 32 bytes are nonzero (this will be used as the "other" public key).
+        let report_data_offset = quote_len - 64;
+        for i in report_data_offset..(report_data_offset + 32) {
+            quote[i] = 1; // dummy public key (all ones)
+        }
+
+        // Create a dummy collateral.
+        let collateral = vec![0u8; 10];
+
+        // Now call try_get_secret_key_by_image. Since we have not added a secret key for this image,
+        // we expect an error.
+        let res = try_get_secret_key_by_image(deps.as_ref(), mock_env(), quote, collateral);
+        println!("Result: {:?}", res);
+
+        match res {
+            Err(e) => {
+                // Check that the error message matches our expectation.
+                assert_eq!(
+                    e.to_string(),
+                    "Generic error: Secret key for this image has not been created"
+                );
+            }
+            Ok(_) => panic!("Expected error since no secret key was added for this image"),
         }
     }
 

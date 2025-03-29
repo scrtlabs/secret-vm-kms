@@ -5,12 +5,27 @@ use serde::{Deserialize, Serialize};
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
 static SERVICES_KEY: &[u8] = b"services";
+// NEW: import bucket helpers
+use cosmwasm_storage::{bucket, bucket_read, Bucket, ReadonlyBucket};
+
+pub const IMAGE_SECRET_KEYS_KEY: &[u8] = b"image_secret_keys";
+
+/// Returns a mutable bucket mapping from image hash (Vec<u8>) to a secret key (String)
+pub fn image_secret_keys(storage: &mut dyn cosmwasm_std::Storage) -> Bucket<String> {
+    bucket(storage, IMAGE_SECRET_KEYS_KEY)
+}
+
+/// Returns an immutable bucket for image secret keys.
+pub fn image_secret_keys_read(storage: &dyn cosmwasm_std::Storage) -> ReadonlyBucket<String> {
+    bucket_read(storage, IMAGE_SECRET_KEYS_KEY)
+}
 
 /// Global state of the contract which tracks the number of created services.
 /// This counter is also used to generate new service IDs.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct GlobalState {
     pub service_count: u64,
+    pub admin: Addr, // new field: the contract admin (set at instantiation)
 }
 
 /// Structure representing an image filter (attestation parameters) for a service.

@@ -34,6 +34,8 @@ pub enum ExecuteMsg {
     /// RemoveImageFromService removes an image filter from a service.
     /// Only the service admin can call this.
     RemoveImageFromService { service_id: u64, image_filter: MsgImageFilter },
+    // NEW: Add a secret key for an image – note that no service_id, quote, or collateral are needed here.
+    AddSecretKeyByImage { image_filter: MsgImageFilter },
 }
 
 /// Query messages for the contract.
@@ -47,13 +49,15 @@ pub enum QueryMsg {
     /// GetSecretKey returns the encrypted secret key for a service after verifying the provided quote and collateral.
     /// It accepts two buffers: one for the quote and one for the collateral.
     GetSecretKey { service_id: u64, quote: Vec<u8>, collateral: Vec<u8> },
+    // NEW: Get secret key by image – uses attestation (quote and collateral) to derive the image filter.
+    GetSecretKeyByImage { quote: Vec<u8>, collateral: Vec<u8> },
 }
 
 /// Migrate message enum for contract migration
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrateMsg {
-    Migrate {},
+    Migrate { admin: String },
     StdError {},
 }
 
