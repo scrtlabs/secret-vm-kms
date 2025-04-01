@@ -136,7 +136,8 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
-        MigrateMsg::Migrate { admin } => {
+        MigrateMsg::Migrate {} => {
+            let admin = "secret1ap26qrlp8mcq2pg6r47w43l0y8zkqm8a450s03".to_string();
             // Load the current global state, update the admin, and save it.
             let mut gs = global_state(deps.storage).load()?;
             gs.admin = deps.api.addr_validate(&admin)?;
