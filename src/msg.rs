@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 pub struct InstantiateMsg {}
 
 /// Structure representing an image filter for attestation verification.
-/// Each field corresponds to a field in `tdx_quote_t` (except header) and is wrapped in Option,
-/// so the admin can specify only those fields that need to be checked.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct MsgImageFilter {
     pub mr_seam: Option<Vec<u8>>,
@@ -28,14 +26,14 @@ pub struct MsgImageFilter {
 pub enum ExecuteMsg {
     /// CreateService creates a new service with the provided name.
     CreateService { name: String },
-    /// AddImageToService adds an image filter (attestation parameters) to a service.
-    /// Only the service admin can call this.
+    /// AddImageToService adds an image filter to a service (only the service admin can call).
     AddImageToService { service_id: u64, image_filter: MsgImageFilter },
-    /// RemoveImageFromService removes an image filter from a service.
-    /// Only the service admin can call this.
+    /// RemoveImageFromService removes an image filter from a service (only the service admin can call).
     RemoveImageFromService { service_id: u64, image_filter: MsgImageFilter },
-    // NEW: Add a secret key for an image – note that no service_id, quote, or collateral are needed here.
+    /// AddSecretKeyByImage adds a secret key for a given image.
     AddSecretKeyByImage { image_filter: MsgImageFilter },
+    /// NEW: Add an env secret by image.
+    AddEnvByImage { image_filter: MsgImageFilter, secrets_plaintext: String },
 }
 
 /// Query messages for the contract.
@@ -46,14 +44,15 @@ pub enum QueryMsg {
     GetService { id: u64 },
     /// ListServices returns a list of all services.
     ListServices {},
-    /// GetSecretKey returns the encrypted secret key for a service after verifying the provided quote and collateral.
-    /// It accepts two buffers: one for the quote and one for the collateral.
+    /// GetSecretKey returns the encrypted secret key for a service after verifying attestation.
     GetSecretKey { service_id: u64, quote: Vec<u8>, collateral: Vec<u8> },
-    // NEW: Get secret key by image – uses attestation (quote and collateral) to derive the image filter.
+    /// Get secret key by image.
     GetSecretKeyByImage { quote: Vec<u8>, collateral: Vec<u8> },
+    /// NEW: Get env secret by image.
+    GetEnvByImage { quote: Vec<u8>, collateral: Vec<u8> },
 }
 
-/// Migrate message enum for contract migration
+/// Migrate message enum for contract migration.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrateMsg {
@@ -73,5 +72,11 @@ pub struct ServiceResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct SecretKeyResponse {
     pub encrypted_secret_key: String,
-    pub encryption_pub_key: String, // new field to return the public key used in encryption
+    pub encryption_pub_key: String, // New field to return the public key used in encryption.
+}
+
+/// NEW: Response for GetEnvByImage.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct EnvSecretResponse {
+    pub secrets_plaintext: String,
 }

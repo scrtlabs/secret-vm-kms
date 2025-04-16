@@ -7,8 +7,8 @@ use std::backtrace::Backtrace;
 use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read};
+use crate::msg::{EnvSecretResponse, ExecuteMsg, InstantiateMsg, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 
@@ -86,30 +86,31 @@ extern "C" {
 /// - `Ok(u32)` with the verification result (from the low half of the returned value)
 ///   if the verification is successful (i.e., error code is 0).
 /// - `Err(SigningError)` if an error occurs (i.e., non-zero error code).
+// Production version: only compiled when not testing.
+#[cfg(not(test))]
 fn dcap_quote_verify_internal(quote: &[u8], collateral: &[u8]) -> Result<u32, SigningErrorC> {
-    // Pack the input data into memory regions for FFI
+    // Original implementation that uses build_region and an external FFI call.
     let quote_region = build_region(quote);
     let quote_ptr = &*quote_region as *const Region as u32;
 
     let collateral_region = build_region(collateral);
     let collateral_ptr = &*collateral_region as *const Region as u32;
 
-    // Call the external function to verify the DCAP quote
     let result = unsafe { dcap_quote_verify(quote_ptr, collateral_ptr) };
-
-    // Decode the returned 64-bit value:
-    // - The high half is the error code.
-    // - The low half is the verification result.
     let error_code = from_high_half(result);
     let verify_result = from_low_half(result);
 
-    // Process the result based on the error code
     match error_code {
         0 => Ok(verify_result),
-        error_code => Err(SigningErrorC::UnknownErr {
-            error_code,
-        }),
+        error_code => Err(SigningErrorC::UnknownErr { error_code }),
     }
+}
+
+// Test version: only compiled when testing.
+#[cfg(test)]
+fn dcap_quote_verify_internal(_quote: &[u8], _collateral: &[u8]) -> Result<u32, SigningErrorC> {
+    // Simply return Ok(0) in tests.
+    Ok(0)
 }
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
@@ -166,6 +167,9 @@ pub fn instantiate(
     let svc_list: Vec<Service> = Vec::new();
     services(deps.storage).save(&svc_list)?;
     // Also initialize the bucket for image secret keys (nothing to store initially)
+    // And initialize the environment secrets as an empty vector.
+    let env_list: Vec<EnvSecret> = Vec::new();
+    env_secrets(deps.storage).save(&env_list)?;
     Ok(Response::default())
 }
 
@@ -188,7 +192,78 @@ pub fn execute(
         ExecuteMsg::AddSecretKeyByImage { image_filter } => {
             try_add_secret_key_by_image(deps, env, info, image_filter)
         }
+        // NEW: New operation to add or update an env secret by image.
+        ExecuteMsg::AddEnvByImage { image_filter, secrets_plaintext } => {
+            try_add_env_by_image(deps, env, info, image_filter, secrets_plaintext)
+        }
     }
+}
+
+/// NEW: Add or update an environment secret by image.
+/// This function expects that the provided image filter includes non‑None values for
+/// mr_td, rtmr1, rtmr2, and rtmr3, and it takes an additional secrets_plaintext string.
+/// Only the admin can call this method.
+pub fn try_add_env_by_image(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    image_filter: MsgImageFilter,
+    secrets_plaintext: String,
+) -> StdResult<Response> {
+    // Ensure the sender is the global admin.
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err(
+            "Only the admin can add env secrets",
+        ));
+    }
+    // Check that the required fields are provided.
+    if image_filter.mr_td.is_none()
+        || image_filter.rtmr1.is_none()
+        || image_filter.rtmr2.is_none()
+        || image_filter.rtmr3.is_none()
+    {
+        return Err(StdError::generic_err(
+            "Missing required fields in ImageFilter (mr_td, rtmr1, rtmr2, rtmr3 required)",
+        ));
+    }
+    // Create a new EnvSecret structure from the provided image filter.
+    let new_env_secret = EnvSecret {
+        mr_td: image_filter.mr_td.clone().unwrap(),
+        rtmr1: image_filter.rtmr1.clone().unwrap(),
+        rtmr2: image_filter.rtmr2.clone().unwrap(),
+        rtmr3: image_filter.rtmr3.clone().unwrap(),
+        secrets_plaintext: secrets_plaintext.clone(),
+    };
+
+    // Load the current vector of environment secrets; if not found, initialize an empty vector.
+    let mut env_secrets_list: Vec<EnvSecret> =
+        env_secrets(deps.storage).load().unwrap_or_else(|_| Vec::new());
+
+    // Look for an existing secret with matching fields.
+    let mut updated = false;
+    for secret in env_secrets_list.iter_mut() {
+        if secret.mr_td == new_env_secret.mr_td
+            && secret.rtmr1 == new_env_secret.rtmr1
+            && secret.rtmr2 == new_env_secret.rtmr2
+            && secret.rtmr3 == new_env_secret.rtmr3
+        {
+            // Update the plaintext.
+            secret.secrets_plaintext = secrets_plaintext.clone();
+            updated = true;
+            break;
+        }
+    }
+    // If no matching secret was found, add the new secret.
+    if !updated {
+        env_secrets_list.push(new_env_secret);
+    }
+    // Save the updated env secrets list back to storage.
+    env_secrets(deps.storage).save(&env_secrets_list)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "add_env_by_image")
+        .add_attribute("updated", updated.to_string()))
 }
 
 pub fn try_add_secret_key_by_image(
@@ -575,7 +650,51 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetSecretKeyByImage { quote, collateral } => {
             to_binary(&try_get_secret_key_by_image(deps, env, quote, collateral)?)
         }
+        // NEW: Operation to retrieve env secret by image.
+        QueryMsg::GetEnvByImage { quote, collateral } => {
+            to_binary(&try_get_env_by_image(deps, env, quote, collateral)?)
+        }
     }
+}
+
+/// NEW: Retrieve the environment secret using an attestation.
+/// This function verifies the provided quote and collateral, parses the attestation to extract
+/// mr_td, rtmr1, rtmr2, and rtmr3, and then searches for an env secret with matching fields.
+/// If found, it returns the associated plaintext in a response.
+pub fn try_get_env_by_image(
+    deps: Deps,
+    _env: Env,
+    quote: Vec<u8>,
+    collateral: Vec<u8>,
+) -> StdResult<EnvSecretResponse> {
+    // Verify the attestation and parse the quote.
+    let tdx_quote = parse_tdx_attestation(&quote, &collateral).ok_or_else(|| {
+        StdError::generic_err("Attestation verification failed or quote invalid")
+    })?;
+    // Extract the relevant fields from the parsed tdx_quote.
+    let tdx_mr_td = tdx_quote.mr_td.to_vec();
+    let tdx_rtmr1 = tdx_quote.rtmr1.to_vec();
+    let tdx_rtmr2 = tdx_quote.rtmr2.to_vec();
+    let tdx_rtmr3 = tdx_quote.rtmr3.to_vec();
+
+    // Load the list of environment secrets.
+    let env_secrets_list: Vec<EnvSecret> =
+        env_secrets_read(deps.storage).load()?;
+    // Search for a secret with matching fields.
+    for secret in env_secrets_list.into_iter() {
+        if secret.mr_td == tdx_mr_td
+            && secret.rtmr1 == tdx_rtmr1
+            && secret.rtmr2 == tdx_rtmr2
+            && secret.rtmr3 == tdx_rtmr3
+        {
+            return Ok(EnvSecretResponse {
+                secrets_plaintext: secret.secrets_plaintext,
+            });
+        }
+    }
+    Err(StdError::generic_err(
+        "No env secret found matching the attestation",
+    ))
 }
 
 /// Returns information about a service by its ID.
@@ -609,6 +728,15 @@ mod tests {
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
     use cosmwasm_std::{from_binary, StdError};
 
+    // Override the external function dcap_quote_verify in tests so that it always returns 0,
+    // meaning error_code is 0 and verification result is 0.
+    #[cfg(test)]
+    #[no_mangle]
+    pub extern "C" fn dcap_quote_verify(_quote_ptr: u32, _collateral_ptr: u32) -> u64 {
+        0
+    }
+
+
     #[test]
     fn proper_initialization() {
         let mut deps = mock_dependencies();
@@ -619,6 +747,8 @@ mod tests {
         let res = query(deps.as_ref(), mock_env(), QueryMsg::ListServices {}).unwrap();
         let services_list: Vec<ServiceResponse> = from_binary(&res).unwrap();
         assert_eq!(services_list.len(), 0);
+        let env_secrets_list: Vec<EnvSecret> = env_secrets_read(&deps.storage).load().unwrap();
+        assert_eq!(env_secrets_list.len(), 0);
     }
 
     #[test]
@@ -857,6 +987,42 @@ mod tests {
     }
 
     #[test]
+    fn add_env_by_image_works() {
+        // Set up dependencies and initialize the contract.
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        let init_msg = InstantiateMsg {};
+        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // Create an image filter with the required fields (mr_td, rtmr1, rtmr2, rtmr3).
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(vec![10u8; 48]),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: Some(vec![20u8; 48]),
+            rtmr2: Some(vec![30u8; 48]),
+            rtmr3: Some(vec![40u8; 48]),
+        };
+
+        // Prepare the ExecuteMsg with AddEnvByImage.
+        let exec_msg = ExecuteMsg::AddEnvByImage {
+            image_filter: image_filter.clone(),
+            secrets_plaintext: "env_secret_plaintext".to_string(),
+        };
+
+        // Execute the message.
+        let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), exec_msg)
+            .expect("AddEnvByImage execution failed");
+
+        // Check that the response contains an attribute "action" with value "add_env_by_image".
+        assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_env_by_image"));
+    }
+
+    #[test]
     fn get_secret_key_by_image_without_adding() {
         use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
 
@@ -911,6 +1077,94 @@ mod tests {
             }
             Ok(_) => panic!("Expected error since no secret key was added for this image"),
         }
+    }
+
+    #[test]
+    fn get_env_by_image_returns_secret() {
+        // Set up dependencies and initialize the contract.
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        let init_msg = InstantiateMsg {};
+        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // First, add an environment secret using AddEnvByImage.
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(vec![10u8; 48]),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: Some(vec![20u8; 48]),
+            rtmr2: Some(vec![30u8; 48]),
+            rtmr3: Some(vec![40u8; 48]),
+        };
+
+        let add_env_msg = ExecuteMsg::AddEnvByImage {
+            image_filter: image_filter.clone(),
+            secrets_plaintext: "env_secret_plaintext".to_string(),
+        };
+        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_env_msg)
+            .expect("AddEnvByImage execution failed");
+
+        // Create a fake quote that meets the required attestation conditions.
+        // Allocate a buffer of size equal to tdx_quote_t.
+        let quote_len = mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len];
+
+        // Set header values:
+        // version = 4 (little-endian)
+        quote[0] = 4;
+        quote[1] = 0;
+        // tee_type = 0x81 in little-endian, starting from byte 4.
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
+
+        // Set the mr_td field (bytes 184..232) to the value [10u8; 48]
+        let mr_td_offset = 184;
+        quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&[10u8; 48]);
+
+        // Set rtmr1 field (bytes 424..472) to [20u8; 48]
+        let rtmr1_offset = 424;
+        quote[rtmr1_offset..rtmr1_offset + 48].copy_from_slice(&[20u8; 48]);
+
+        // Set rtmr2 field (bytes 472..520) to [30u8; 48]
+        let rtmr2_offset = 472;
+        quote[rtmr2_offset..rtmr2_offset + 48].copy_from_slice(&[30u8; 48]);
+
+        // Set rtmr3 field (bytes 520..568) to [40u8; 48]
+        let rtmr3_offset = 520;
+        quote[rtmr3_offset..rtmr3_offset + 48].copy_from_slice(&[40u8; 48]);
+
+        // Fill report_data (bytes 568..632) first 32 bytes with non-zero values (required for extracting a public key)
+        let report_data_offset = 568;
+        for i in report_data_offset..(report_data_offset + 32) {
+            quote[i] = 1;
+        }
+
+        // Create a dummy collateral (content not used in this test)
+        let collateral = vec![0u8; 10];
+
+        // Build the query message to retrieve the env secret.
+        let query_msg = QueryMsg::GetEnvByImage {
+            quote: quote.clone(),
+            collateral: collateral.clone(),
+        };
+
+        // Query and deserialize the response.
+        let res_bin = query(deps.as_ref(), mock_env(), query_msg)
+            .expect("GetEnvByImage query failed");
+        let env_secret_response: EnvSecretResponse = from_binary(&res_bin)
+            .expect("Failed to deserialize EnvSecretResponse");
+
+        // Print the response.
+        println!("Env secret response: {:#?}", env_secret_response);
+
+        // Verify that the returned plaintext matches the one set earlier.
+        assert_eq!(env_secret_response.secrets_plaintext, "env_secret_plaintext".to_string());
     }
 
     #[test]

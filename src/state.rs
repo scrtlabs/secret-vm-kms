@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
 static SERVICES_KEY: &[u8] = b"services";
+// NEW: Key for storing env secrets.
+pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
+
 // NEW: import bucket helpers
 use cosmwasm_storage::{bucket, bucket_read, Bucket, ReadonlyBucket};
 
@@ -18,6 +21,16 @@ pub fn image_secret_keys(storage: &mut dyn cosmwasm_std::Storage) -> Bucket<Stri
 /// Returns an immutable bucket for image secret keys.
 pub fn image_secret_keys_read(storage: &dyn cosmwasm_std::Storage) -> ReadonlyBucket<String> {
     bucket_read(storage, IMAGE_SECRET_KEYS_KEY)
+}
+
+/// NEW: Returns a mutable singleton for the list of environment secrets.
+pub fn env_secrets(storage: &mut dyn Storage) -> Singleton<Vec<EnvSecret>> {
+    singleton(storage, ENV_SECRETS_KEY)
+}
+
+/// NEW: Returns an immutable singleton for the list of environment secrets.
+pub fn env_secrets_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<EnvSecret>> {
+    singleton_read(storage, ENV_SECRETS_KEY)
 }
 
 /// Global state of the contract which tracks the number of created services.
@@ -78,4 +91,14 @@ pub fn services(storage: &mut dyn Storage) -> Singleton<Vec<Service>> {
 /// Returns an immutable singleton for the list of services.
 pub fn services_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<Service>> {
     singleton_read(storage, SERVICES_KEY)
+}
+
+/// NEW: Structure representing an environment secret.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct EnvSecret {
+    pub mr_td: Vec<u8>,
+    pub rtmr1: Vec<u8>,
+    pub rtmr2: Vec<u8>,
+    pub rtmr3: Vec<u8>,
+    pub secrets_plaintext: String,
 }
