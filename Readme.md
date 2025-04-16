@@ -139,7 +139,7 @@ For both service keys and image/environment keys, the following procedure is use
 2. **Adding an Image Filter to a Service**
 
    **Request:**
-   ```json
+   ```
    {
      "add_image_to_service": {
        "service_id": 0,
@@ -163,7 +163,7 @@ For both service keys and image/environment keys, the following procedure is use
 1. **Adding a Secret Key by Image**
 
    **Request:**
-   ```json
+   ```
    {
      "add_secret_key_by_image": {
        "image_filter": {
@@ -188,7 +188,7 @@ For both service keys and image/environment keys, the following procedure is use
 1. **Adding an Environment Secret by Image**
 
    **Request:**
-   ```json
+   ```
    {
      "add_env_by_image": {
        "image_filter": {
@@ -207,7 +207,7 @@ For both service keys and image/environment keys, the following procedure is use
 2. **Retrieving an Environment Secret by Image**
 
    **Request:**
-   ```json
+   ```
    {
      "get_env_by_image": {
        "quote": [ ... array of bytes representing the TDX quote ... ],
