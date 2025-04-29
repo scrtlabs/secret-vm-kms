@@ -137,16 +137,7 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
-        MigrateMsg::Migrate {} => {
-            let admin = "secret1ap26qrlp8mcq2pg6r47w43l0y8zkqm8a450s03".to_string();
-            // Load the current global state, update the admin, and save it.
-            let mut gs = global_state(deps.storage).load()?;
-            gs.admin = deps.api.addr_validate(&admin)?;
-            global_state(deps.storage).save(&gs)?;
-            Ok(Response::new()
-                .add_attribute("action", "migrate")
-                .add_attribute("admin", gs.admin.to_string()))
-        }
+        MigrateMsg::Migrate {} => Ok(Response::default()),
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
 }
@@ -272,46 +263,52 @@ pub fn try_add_secret_key_by_image(
     info: MessageInfo,
     image_filter: MsgImageFilter,
 ) -> StdResult<Response> {
-    // Ensure the sender is the global admin.
+    // Only admin may add
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
         return Err(StdError::generic_err("Only the contract admin can add a secret key by image"));
     }
-    // Serialize the image filter (as provided) and compute its hash.
-    let image_filter_serialized = serde_json::to_vec(&image_filter)
-        .map_err(|_| StdError::generic_err("Failed to serialize image filter"))?;
-    let mut hasher = Sha256::new();
-    // Use the image filter serialization (you could also include extra image field data if needed)
-    sha2::Digest::update(&mut hasher, &image_filter_serialized);
-    let image_hash = hasher.finalize();
-    let image_key = image_hash.to_vec();
 
-    // Access the separate bucket for image secret keys.
+    // Pull out just the four required fields (error if any missing)
+    let mr_td    = image_filter.mr_td
+        .ok_or_else(|| StdError::generic_err("mr_td required"))?;
+    let rtmr1    = image_filter.rtmr1
+        .ok_or_else(|| StdError::generic_err("rtmr1 required"))?;
+    let rtmr2    = image_filter.rtmr2
+        .ok_or_else(|| StdError::generic_err("rtmr2 required"))?;
+    let rtmr3    = image_filter.rtmr3
+        .ok_or_else(|| StdError::generic_err("rtmr3 required"))?;
+
+    // Serialize *only* those
+    let mut ser = Vec::new();
+    ser.extend(&mr_td);
+    ser.extend(&rtmr1);
+    ser.extend(&rtmr2);
+    ser.extend(&rtmr3);
+
+    let mut hasher = Sha256::new();
+    sha2::Digest::update(&mut hasher, &ser);
+    let image_key = hasher.finalize().to_vec();
+
     let mut bucket = image_secret_keys(deps.storage);
     if bucket.load(&image_key).is_ok() {
         return Ok(Response::new()
             .add_attribute("action", "add_secret_key_by_image")
-            .add_attribute("message", "Secret key for this image already exists"));
+            .add_attribute("message", "Already exists"));
     }
 
-    // Create a new secret key for the image using env.block.random (same as in service creation).
+    // Derive a new secret exactly as before...
     let mut key_hasher = Sha256::new();
-    let mut random_bytes = Vec::new();
-    // Use the block random to create a seed (just like in try_create_service)
-    for bin in env.block.random.iter() {
-        random_bytes.extend_from_slice(bin.as_slice());
-    }
-    // Incorporate the random bytes and image data (e.g., the serialized image filter) into the seed.
+    let mut random_bytes = env.block.random.iter().flat_map(|b| b.as_slice()).cloned().collect::<Vec<_>>();
     sha2::Digest::update(&mut key_hasher, &random_bytes);
-    sha2::Digest::update(&mut key_hasher, &image_filter_serialized);
-    let new_secret = key_hasher.finalize().to_vec();
+    sha2::Digest::update(&mut key_hasher, &ser);
+    let secret = key_hasher.finalize().to_vec();
 
-    // Store the new secret key (unencrypted, as a hex string) in the bucket.
-    bucket.save(&image_key, &hex::encode(new_secret.clone()))?;
+    bucket.save(&image_key, &hex::encode(&secret))?;
 
     Ok(Response::new()
         .add_attribute("action", "add_secret_key_by_image")
-        .add_attribute("message", "Secret key created for the image"))
+        .add_attribute("message", "Secret key created"))
 }
 
 /// Handles creating a new service.
@@ -594,47 +591,33 @@ pub fn try_get_secret_key_by_image(
     quote: Vec<u8>,
     collateral: Vec<u8>,
 ) -> StdResult<SecretKeyResponse> {
-    // Parse the attestation.
-    let tdx_quote = parse_tdx_attestation(&quote, &collateral)
-        .ok_or_else(|| StdError::generic_err("Attestation verification failed or quote invalid"))?;
-    // Reconstruct a minimal image filter from tdx_quote fields.
-    let image_filter = MsgImageFilter {
-        mr_seam: Some(tdx_quote.mr_seam.to_vec()),
-        mr_signer_seam: Some(tdx_quote.mr_signer_seam.to_vec()),
-        mr_td: Some(tdx_quote.mr_td.to_vec()),
-        mr_config_id: Some(tdx_quote.mr_config_id.to_vec()),
-        mr_owner: Some(tdx_quote.mr_owner.to_vec()),
-        mr_config: Some(tdx_quote.mr_config.to_vec()),
-        rtmr0: Some(tdx_quote.rtmr0.to_vec()),
-        rtmr1: Some(tdx_quote.rtmr1.to_vec()),
-        rtmr2: Some(tdx_quote.rtmr2.to_vec()),
-        rtmr3: Some(tdx_quote.rtmr3.to_vec()),
-    };
-    let image_filter_serialized = serde_json::to_vec(&image_filter)
-        .map_err(|_| StdError::generic_err("Failed to serialize image filter"))?;
+    let tdx = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Attestation verification failed"))?;
+
+    // Extract only the four slices
+    let mr_td  = tdx.mr_td.to_vec();
+    let r1     = tdx.rtmr1.to_vec();
+    let r2     = tdx.rtmr2.to_vec();
+    let r3     = tdx.rtmr3.to_vec();
+
     let mut hasher = Sha256::new();
-    sha2::Digest::update(&mut hasher, &image_filter_serialized);
-    let image_hash = hasher.finalize();
-    let image_key = image_hash.to_vec();
+    sha2::Digest::update(&mut hasher, &mr_td);
+    sha2::Digest::update(&mut hasher, &r1);
+    sha2::Digest::update(&mut hasher, &r2);
+    sha2::Digest::update(&mut hasher, &r3);
+    let image_key = hasher.finalize().to_vec();
 
     let bucket = image_secret_keys_read(deps.storage);
-    let stored_secret_hex = bucket
-        .load(&image_key)
-        .map_err(|_| StdError::generic_err("Secret key for this image has not been created"))?;
-    // Convert stored secret key back to bytes.
-    let stored_secret = hex::decode(stored_secret_hex)
-        .map_err(|_| StdError::generic_err("Failed to decode stored secret key"))?;
+    let secret_hex = bucket.load(&image_key)
+        .map_err(|_| StdError::generic_err("No secret for this image"))?;
+    let secret_bytes = hex::decode(&secret_hex)
+        .map_err(|_| StdError::generic_err("Stored secret is malformed"))?;
 
-    // Extract the "other" public key from report_data.
-    let other_pub_key: [u8; 32] = tdx_quote.report_data[0..32]
-        .try_into()
-        .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
-    // Use env.block.height as height.
+    // Now encrypt exactly as in `try_get_secret_key`
+    let other_pub: [u8;32] = tdx.report_data[0..32].try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
     let height_bytes = env.block.height.to_string().into_bytes();
-
-    // Encrypt the stored secret key using the same encryption procedure.
-    let response = encrypt_secret(stored_secret, other_pub_key, &quote, height_bytes)?;
-    Ok(response)
+    encrypt_secret(secret_bytes, other_pub, &quote, height_bytes)
 }
 
 
@@ -660,41 +643,39 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 /// NEW: Retrieve the environment secret using an attestation.
 /// This function verifies the provided quote and collateral, parses the attestation to extract
 /// mr_td, rtmr1, rtmr2, and rtmr3, and then searches for an env secret with matching fields.
-/// If found, it returns the associated plaintext in a response.
 pub fn try_get_env_by_image(
     deps: Deps,
-    _env: Env,
+    env: Env,
     quote: Vec<u8>,
     collateral: Vec<u8>,
-) -> StdResult<EnvSecretResponse> {
-    // Verify the attestation and parse the quote.
-    let tdx_quote = parse_tdx_attestation(&quote, &collateral).ok_or_else(|| {
-        StdError::generic_err("Attestation verification failed or quote invalid")
-    })?;
-    // Extract the relevant fields from the parsed tdx_quote.
-    let tdx_mr_td = tdx_quote.mr_td.to_vec();
-    let tdx_rtmr1 = tdx_quote.rtmr1.to_vec();
-    let tdx_rtmr2 = tdx_quote.rtmr2.to_vec();
-    let tdx_rtmr3 = tdx_quote.rtmr3.to_vec();
+) -> StdResult<SecretKeyResponse> {
+    // Verify + parse
+    let tdx = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
 
-    // Load the list of environment secrets.
-    let env_secrets_list: Vec<EnvSecret> =
-        env_secrets_read(deps.storage).load()?;
-    // Search for a secret with matching fields.
-    for secret in env_secrets_list.into_iter() {
-        if secret.mr_td == tdx_mr_td
-            && secret.rtmr1 == tdx_rtmr1
-            && secret.rtmr2 == tdx_rtmr2
-            && secret.rtmr3 == tdx_rtmr3
-        {
-            return Ok(EnvSecretResponse {
-                secrets_plaintext: secret.secrets_plaintext,
-            });
+    // Extract mr_td, rtmr1, rtmr2, rtmr3
+    let mr_td = tdx.mr_td.to_vec();
+    let r1    = tdx.rtmr1.to_vec();
+    let r2    = tdx.rtmr2.to_vec();
+    let r3    = tdx.rtmr3.to_vec();
+
+    // Find the EnvSecret
+    let list = env_secrets_read(deps.storage).load()?;
+    let secret_plain = list.into_iter().find_map(|e| {
+        if e.mr_td == mr_td && e.rtmr1 == r1 && e.rtmr2 == r2 && e.rtmr3 == r3 {
+            Some(e.secrets_plaintext)
+        } else {
+            None
         }
-    }
-    Err(StdError::generic_err(
-        "No env secret found matching the attestation",
-    ))
+    }).ok_or_else(|| StdError::generic_err("No env secret found"))?;
+
+    // Encrypt that plaintext
+    let other_pub: [u8;32] = tdx.report_data[0..32].try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    let height_bytes = env.block.height.to_string().into_bytes();
+    let plaintext_bytes = secret_plain.as_bytes().to_vec();
+    // we need a helper to encrypt arbitrary bytes:
+    encrypt_secret(plaintext_bytes, other_pub, &quote, height_bytes)
 }
 
 /// Returns information about a service by its ID.
@@ -1148,23 +1129,23 @@ mod tests {
         // Create a dummy collateral (content not used in this test)
         let collateral = vec![0u8; 10];
 
-        // Build the query message to retrieve the env secret.
+        // Query
         let query_msg = QueryMsg::GetEnvByImage {
             quote: quote.clone(),
             collateral: collateral.clone(),
         };
+        let res_bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let resp: SecretKeyResponse = from_binary(&res_bin).unwrap();
 
-        // Query and deserialize the response.
-        let res_bin = query(deps.as_ref(), mock_env(), query_msg)
-            .expect("GetEnvByImage query failed");
-        let env_secret_response: EnvSecretResponse = from_binary(&res_bin)
-            .expect("Failed to deserialize EnvSecretResponse");
+        println!("resp: {:#?}", resp);
 
-        // Print the response.
-        println!("Env secret response: {:#?}", env_secret_response);
+        // Should be non‐empty hex and valid hex
+        assert!(!resp.encrypted_secret_key.is_empty());
+        assert!(hex::decode(&resp.encrypted_secret_key).is_ok());
 
-        // Verify that the returned plaintext matches the one set earlier.
-        assert_eq!(env_secret_response.secrets_plaintext, "env_secret_plaintext".to_string());
+        // And the public key string:
+        assert!(!resp.encryption_pub_key.is_empty());
+        assert!(hex::decode(&resp.encryption_pub_key).is_ok());
     }
 
     #[test]
