@@ -609,7 +609,7 @@ pub fn try_get_secret_key_by_image(
 
     let bucket = image_secret_keys_read(deps.storage);
     let secret_hex = bucket.load(&image_key)
-        .map_err(|_| StdError::generic_err("No secret for this image"))?;
+        .map_err(|_| StdError::generic_err("Secret key for this image has not been created"))?;
     let secret_bytes = hex::decode(&secret_hex)
         .map_err(|_| StdError::generic_err("Stored secret is malformed"))?;
 
@@ -648,7 +648,7 @@ pub fn try_get_env_by_image(
     env: Env,
     quote: Vec<u8>,
     collateral: Vec<u8>,
-) -> StdResult<SecretKeyResponse> {
+) -> StdResult<EnvSecretResponse> {
     // Verify + parse
     let tdx = parse_tdx_attestation(&quote, &collateral)
         .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
@@ -675,7 +675,12 @@ pub fn try_get_env_by_image(
     let height_bytes = env.block.height.to_string().into_bytes();
     let plaintext_bytes = secret_plain.as_bytes().to_vec();
     // we need a helper to encrypt arbitrary bytes:
-    encrypt_secret(plaintext_bytes, other_pub, &quote, height_bytes)
+    let encrypted = encrypt_secret(plaintext_bytes, other_pub, &quote, height_bytes)
+        .map_err(|_| StdError::generic_err("Encryption failed"))?;
+    Ok(EnvSecretResponse {
+        encrypted_secrets_plaintext: encrypted.encrypted_secret_key,
+        encryption_pub_key: encrypted.encryption_pub_key,
+    })
 }
 
 /// Returns information about a service by its ID.
@@ -803,6 +808,17 @@ mod tests {
         // Construct a dummy quote buffer of size_of::<tdx_quote_t>()
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
+
+        // set quote version to 4 and tee_type to 0x81
+        quote[0] = 4;  // version low byte
+        quote[1] = 0;  // version high byte
+
+        // Set tee_type = 0x81 (129) as a u32 in little endian:
+        quote[4] = 129; // 0x81
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
+
         // Set mr_td field in the quote.
         // tdx_quote_t layout: header (2+2+4+4+16+20 = 48 bytes), then tcb_svn (16), mr_seam (48), mr_signer_seam (48), seam_attributes (8), td_attributes (8), xfam (8), then mr_td (48).
         // mr_td offset = 48 + 16 + 48 + 48 + 8 + 8 + 8 = 184.
@@ -813,7 +829,8 @@ mod tests {
         let get_msg = QueryMsg::GetSecretKey { service_id: 0, quote: quote.clone(), collateral: collateral.clone() };
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
-        assert_eq!(secret_key.encrypted_secret_key, "encrypted_secret_key");
+        assert!(!secret_key.encrypted_secret_key.is_empty());
+        assert!(!secret_key.encryption_pub_key.is_empty());
     }
 
     #[test]
@@ -1135,13 +1152,13 @@ mod tests {
             collateral: collateral.clone(),
         };
         let res_bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
-        let resp: SecretKeyResponse = from_binary(&res_bin).unwrap();
+        let resp: EnvSecretResponse = from_binary(&res_bin).unwrap();
 
         println!("resp: {:#?}", resp);
 
         // Should be non‐empty hex and valid hex
-        assert!(!resp.encrypted_secret_key.is_empty());
-        assert!(hex::decode(&resp.encrypted_secret_key).is_ok());
+        assert!(!resp.encrypted_secrets_plaintext.is_empty());
+        assert!(hex::decode(&resp.encrypted_secrets_plaintext).is_ok());
 
         // And the public key string:
         assert!(!resp.encryption_pub_key.is_empty());

@@ -78,5 +78,6 @@ pub struct SecretKeyResponse {
 /// NEW: Response for GetEnvByImage.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct EnvSecretResponse {
-    pub secrets_plaintext: String,
+    pub encrypted_secrets_plaintext: String,
+    pub encryption_pub_key: String,
 }
