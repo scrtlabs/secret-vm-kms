@@ -100,5 +100,6 @@ pub struct EnvSecret {
     pub rtmr1: Vec<u8>,
     pub rtmr2: Vec<u8>,
     pub rtmr3: Vec<u8>,
+    pub vm_name: String,
     pub secrets_plaintext: String,
 }

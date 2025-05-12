@@ -208,6 +208,11 @@ pub fn try_add_env_by_image(
             "Only the admin can add env secrets",
         ));
     }
+
+    // Extract the VM name (required)
+    let vm_name = image_filter.vm_name
+        .ok_or_else(|| StdError::generic_err("vm_name required"))?;
+
     // Check that the required fields are provided.
     if image_filter.mr_td.is_none()
         || image_filter.rtmr1.is_none()
@@ -224,6 +229,7 @@ pub fn try_add_env_by_image(
         rtmr1: image_filter.rtmr1.clone().unwrap(),
         rtmr2: image_filter.rtmr2.clone().unwrap(),
         rtmr3: image_filter.rtmr3.clone().unwrap(),
+        vm_name: vm_name.clone(),
         secrets_plaintext: secrets_plaintext.clone(),
     };
 
@@ -238,6 +244,7 @@ pub fn try_add_env_by_image(
             && secret.rtmr1 == new_env_secret.rtmr1
             && secret.rtmr2 == new_env_secret.rtmr2
             && secret.rtmr3 == new_env_secret.rtmr3
+            && secret.vm_name == new_env_secret.vm_name
         {
             // Update the plaintext.
             secret.secrets_plaintext = secrets_plaintext.clone();
@@ -269,6 +276,11 @@ pub fn try_add_secret_key_by_image(
         return Err(StdError::generic_err("Only the contract admin can add a secret key by image"));
     }
 
+    // Extract the VM name (required)
+    let vm_name = image_filter.vm_name
+    .ok_or_else(|| StdError::generic_err("vm_name required"))?;
+
+
     // Pull out just the four required fields (error if any missing)
     let mr_td    = image_filter.mr_td
         .ok_or_else(|| StdError::generic_err("mr_td required"))?;
@@ -285,6 +297,9 @@ pub fn try_add_secret_key_by_image(
     ser.extend(&rtmr1);
     ser.extend(&rtmr2);
     ser.extend(&rtmr3);
+
+    // Include VM name bytes in the hash
+    ser.extend(vm_name.as_bytes());
 
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &ser);
@@ -600,11 +615,19 @@ pub fn try_get_secret_key_by_image(
     let r2     = tdx.rtmr2.to_vec();
     let r3     = tdx.rtmr3.to_vec();
 
+    // Extract VM name from report_data (treat report_data as null-terminated UTF-8)
+    let vm_name = {
+        let data = &tdx.report_data;
+            let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            String::from_utf8_lossy(&data[..len]).to_string()
+    };
+
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &mr_td);
     sha2::Digest::update(&mut hasher, &r1);
     sha2::Digest::update(&mut hasher, &r2);
     sha2::Digest::update(&mut hasher, &r3);
+    sha2::digest::Update::update(&mut hasher, vm_name.as_bytes());
     let image_key = hasher.finalize().to_vec();
 
     let bucket = image_secret_keys_read(deps.storage);
@@ -658,6 +681,13 @@ pub fn try_get_env_by_image(
     let r1    = tdx.rtmr1.to_vec();
     let r2    = tdx.rtmr2.to_vec();
     let r3    = tdx.rtmr3.to_vec();
+
+    // Extract VM name from report_data
+    let vm_name = {
+         let data = &tdx.report_data;
+            let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            String::from_utf8_lossy(&data[..len]).to_string()
+    };
 
     // Find the EnvSecret
     let list = env_secrets_read(deps.storage).load()?;

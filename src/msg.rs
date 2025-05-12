@@ -18,6 +18,7 @@ pub struct MsgImageFilter {
     pub rtmr1: Option<Vec<u8>>,
     pub rtmr2: Option<Vec<u8>>,
     pub rtmr3: Option<Vec<u8>>,
+    pub vm_name: Option<String>,
 }
 
 /// Execute messages for the contract.
