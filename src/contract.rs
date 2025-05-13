@@ -209,9 +209,9 @@ pub fn try_add_env_by_image(
         ));
     }
 
-    // Extract the VM name (required)
-    let vm_name = image_filter.vm_name
-        .ok_or_else(|| StdError::generic_err("vm_name required"))?;
+    // Extract the VM uid (required)
+    let vm_uid = image_filter.vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
     // Check that the required fields are provided.
     if image_filter.mr_td.is_none()
@@ -229,7 +229,7 @@ pub fn try_add_env_by_image(
         rtmr1: image_filter.rtmr1.clone().unwrap(),
         rtmr2: image_filter.rtmr2.clone().unwrap(),
         rtmr3: image_filter.rtmr3.clone().unwrap(),
-        vm_name: vm_name.clone(),
+        vm_uid: vm_uid.clone(),
         secrets_plaintext: secrets_plaintext.clone(),
     };
 
@@ -244,7 +244,7 @@ pub fn try_add_env_by_image(
             && secret.rtmr1 == new_env_secret.rtmr1
             && secret.rtmr2 == new_env_secret.rtmr2
             && secret.rtmr3 == new_env_secret.rtmr3
-            && secret.vm_name == new_env_secret.vm_name
+            && secret.vm_uid == new_env_secret.vm_uid
         {
             // Update the plaintext.
             secret.secrets_plaintext = secrets_plaintext.clone();
@@ -276,9 +276,9 @@ pub fn try_add_secret_key_by_image(
         return Err(StdError::generic_err("Only the contract admin can add a secret key by image"));
     }
 
-    // Extract the VM name (required)
-    let vm_name = image_filter.vm_name
-    .ok_or_else(|| StdError::generic_err("vm_name required"))?;
+    // Extract the VM UID (required)
+    let vm_uid = image_filter.vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
 
     // Pull out just the four required fields (error if any missing)
@@ -298,8 +298,8 @@ pub fn try_add_secret_key_by_image(
     ser.extend(&rtmr2);
     ser.extend(&rtmr3);
 
-    // Include VM name bytes in the hash
-    ser.extend(vm_name.as_bytes());
+    // Include VM uid bytes in the hash
+    ser.extend(vm_uid.as_bytes());
 
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &ser);
@@ -615,19 +615,15 @@ pub fn try_get_secret_key_by_image(
     let r2     = tdx.rtmr2.to_vec();
     let r3     = tdx.rtmr3.to_vec();
 
-    // Extract VM name from report_data (treat report_data as null-terminated UTF-8)
-    let vm_name = {
-        let data = &tdx.report_data;
-            let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-            String::from_utf8_lossy(&data[..len]).to_string()
-    };
+    // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
+    let vm_uid = hex::encode(&tdx.report_data[32..48]);
 
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &mr_td);
     sha2::Digest::update(&mut hasher, &r1);
     sha2::Digest::update(&mut hasher, &r2);
     sha2::Digest::update(&mut hasher, &r3);
-    sha2::digest::Update::update(&mut hasher, vm_name.as_bytes());
+    sha2::digest::Update::update(&mut hasher, vm_uid.as_bytes());
     let image_key = hasher.finalize().to_vec();
 
     let bucket = image_secret_keys_read(deps.storage);
@@ -682,17 +678,13 @@ pub fn try_get_env_by_image(
     let r2    = tdx.rtmr2.to_vec();
     let r3    = tdx.rtmr3.to_vec();
 
-    // Extract VM name from report_data
-    let vm_name = {
-         let data = &tdx.report_data;
-            let len = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-            String::from_utf8_lossy(&data[..len]).to_string()
-    };
+    // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
+    let vm_uid = hex::encode(&tdx.report_data[32..48]);
 
     // Find the EnvSecret
     let list = env_secrets_read(deps.storage).load()?;
     let secret_plain = list.into_iter().find_map(|e| {
-        if e.mr_td == mr_td && e.rtmr1 == r1 && e.rtmr2 == r2 && e.rtmr3 == r3 {
+        if e.mr_td == mr_td && e.rtmr1 == r1 && e.rtmr2 == r2 && e.rtmr3 == r3 && e.vm_uid == vm_uid{
             Some(e.secrets_plaintext)
         } else {
             None
@@ -801,6 +793,7 @@ mod tests {
             rtmr1: None,
             rtmr2: None,
             rtmr3: None,
+            vm_uid: None,
         };
         let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter: image_filter.clone() };
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
@@ -832,6 +825,7 @@ mod tests {
             rtmr1: None,
             rtmr2: None,
             rtmr3: None,
+            vm_uid: None,
         };
         let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
@@ -901,6 +895,7 @@ mod tests {
             rtmr1: None,
             rtmr2: None,
             rtmr3: None,
+            vm_uid: None,
         };
         let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
@@ -940,6 +935,7 @@ mod tests {
             rtmr1: None,
             rtmr2: None,
             rtmr3: None,
+            vm_uid: None,
         };
         let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
         let res = execute(deps.as_mut(), mock_env(), other_info.clone(), add_msg);
@@ -957,61 +953,61 @@ mod tests {
         use std::path::Path;
         use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
         use cosmwasm_std::{from_binary, StdError};
+        use hex;
 
-        // Initialize dependencies and create the contract with an admin.
+        // Initialize contract
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        let init_msg = InstantiateMsg {};
-        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
 
-        // --- Step 1. Read quote and collateral from files.
-        // (Assumes you have tests/quote.txt and tests/collateral.txt with valid hex strings.)
-        let quote_path = Path::new("tests/quote.txt");
-        let collateral_path = Path::new("tests/collateral.txt");
-        let quote_hex = fs::read_to_string(quote_path)
-            .expect("Failed to read quote.txt")
-            .trim()
-            .to_string();
-        let collateral_hex = fs::read_to_string(collateral_path)
-            .expect("Failed to read collateral.txt")
-            .trim()
-            .to_string();
-        let quote = hex::decode(&quote_hex).expect("Failed to decode quote hex");
-        let collateral = hex::decode(&collateral_hex).expect("Failed to decode collateral hex");
+        // Read quote & collateral from files
+        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt")).unwrap().trim().to_string();
+        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt")).unwrap().trim().to_string();
+        let quote = hex::decode(&quote_hex).unwrap();
+        let collateral = hex::decode(&collateral_hex).unwrap();
 
-        // --- Step 2. Reconstruct the image filter from the attestation.
-        // (This follows the same logic as in try_get_secret_key_by_image.)
-        let tdx_quote = parse_tdx_attestation(&quote, &collateral)
-            .expect("Attestation verification failed or quote invalid");
+        // Parse to get report_data
+        let tdx = parse_tdx_attestation(&quote, &collateral).expect("quote invalid");
+
+        // Extract vm_uid from report_data bytes [32..48]
+        let vm_uid_hex = hex::encode(&tdx.report_data[32..48]);
+
+        // Build filter including that vm_uid
         let image_filter = MsgImageFilter {
-            mr_seam: Some(tdx_quote.mr_seam.to_vec()),
-            mr_signer_seam: Some(tdx_quote.mr_signer_seam.to_vec()),
-            mr_td: Some(tdx_quote.mr_td.to_vec()),
-            mr_config_id: Some(tdx_quote.mr_config_id.to_vec()),
-            mr_owner: Some(tdx_quote.mr_owner.to_vec()),
-            mr_config: Some(tdx_quote.mr_config.to_vec()),
-            rtmr0: Some(tdx_quote.rtmr0.to_vec()),
-            rtmr1: Some(tdx_quote.rtmr1.to_vec()),
-            rtmr2: Some(tdx_quote.rtmr2.to_vec()),
-            rtmr3: Some(tdx_quote.rtmr3.to_vec()),
+            mr_seam: Some(tdx.mr_seam.to_vec()),
+            mr_signer_seam: Some(tdx.mr_signer_seam.to_vec()),
+            mr_td: Some(tdx.mr_td.to_vec()),
+            mr_config_id: Some(tdx.mr_config_id.to_vec()),
+            mr_owner: Some(tdx.mr_owner.to_vec()),
+            mr_config: Some(tdx.mr_config.to_vec()),
+            rtmr0: Some(tdx.rtmr0.to_vec()),
+            rtmr1: Some(tdx.rtmr1.to_vec()),
+            rtmr2: Some(tdx.rtmr2.to_vec()),
+            rtmr3: Some(tdx.rtmr3.to_vec()),
+            vm_uid: Some(vm_uid_hex.clone()),
         };
 
-        // --- Step 3. Execute AddSecretKeyByImage to store a secret key for this image.
-        let add_secret_msg = ExecuteMsg::AddSecretKeyByImage { image_filter: image_filter.clone() };
-        let add_response = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_secret_msg).unwrap();
-        assert!(add_response.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_secret_key_by_image"));
+        // Store the secret key for this image
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            ExecuteMsg::AddSecretKeyByImage { image_filter: image_filter.clone() },
+        ).unwrap();
 
-        // --- Step 4. Query GetSecretKeyByImage.
-        let query_msg = QueryMsg::GetSecretKeyByImage { quote: quote.clone(), collateral: collateral.clone() };
-        let query_response_bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
-        let secret_key_response: SecretKeyResponse = from_binary(&query_response_bin).unwrap();
+        // Now query by image
+        let query_bin = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyByImage { quote: quote.clone(), collateral: collateral.clone() }
+        ).unwrap();
+        let resp: SecretKeyResponse = from_binary(&query_bin).unwrap();
 
-        // Check that we got a non-empty encrypted secret key and a public key.
-        assert!(!secret_key_response.encrypted_secret_key.is_empty());
-        assert!(!secret_key_response.encryption_pub_key.is_empty());
+        println!("resp: {:#?}", resp);
 
-        println!("Encrypted secret key: {}", secret_key_response.encrypted_secret_key);
-        println!("Encryption public key: {}", secret_key_response.encryption_pub_key);
+        // Should have both fields non-empty
+        assert!(!resp.encrypted_secret_key.is_empty());
+        assert!(!resp.encryption_pub_key.is_empty());
     }
 
     #[test]
@@ -1034,6 +1030,7 @@ mod tests {
             rtmr1: Some(vec![20u8; 48]),
             rtmr2: Some(vec![30u8; 48]),
             rtmr3: Some(vec![40u8; 48]),
+            vm_uid: Some("my-vm-id".into())
         };
 
         // Prepare the ExecuteMsg with AddEnvByImage.
@@ -1109,13 +1106,14 @@ mod tests {
 
     #[test]
     fn get_env_by_image_returns_secret() {
-        // Set up dependencies and initialize the contract.
+        const TEST_VM_UID_HEX: &str = "00112233445566778899aabbccddeeff";
+        let vm_uid_bytes = hex::decode(TEST_VM_UID_HEX).unwrap();
+
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        let init_msg = InstantiateMsg {};
-        let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
 
-        // First, add an environment secret using AddEnvByImage.
+        // Add env secret
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
@@ -1127,72 +1125,129 @@ mod tests {
             rtmr1: Some(vec![20u8; 48]),
             rtmr2: Some(vec![30u8; 48]),
             rtmr3: Some(vec![40u8; 48]),
+            vm_uid: Some(TEST_VM_UID_HEX.into()),
         };
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            ExecuteMsg::AddEnvByImage {
+                image_filter: image_filter.clone(),
+                secrets_plaintext: "env_secret_plaintext".to_string(),
+            },
+        ).unwrap();
 
-        let add_env_msg = ExecuteMsg::AddEnvByImage {
-            image_filter: image_filter.clone(),
-            secrets_plaintext: "env_secret_plaintext".to_string(),
-        };
-        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_env_msg)
-            .expect("AddEnvByImage execution failed");
-
-        // Create a fake quote that meets the required attestation conditions.
-        // Allocate a buffer of size equal to tdx_quote_t.
+        // Build dummy quote
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
+        quote[0] = 4; quote[1] = 0;
+        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
 
-        // Set header values:
-        // version = 4 (little-endian)
-        quote[0] = 4;
-        quote[1] = 0;
-        // tee_type = 0x81 in little-endian, starting from byte 4.
-        quote[4] = 129;
-        quote[5] = 0;
-        quote[6] = 0;
-        quote[7] = 0;
-
-        // Set the mr_td field (bytes 184..232) to the value [10u8; 48]
         let mr_td_offset = 184;
         quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&[10u8; 48]);
+        let r1_off = 424;
+        quote[r1_off..r1_off + 48].copy_from_slice(&[20u8; 48]);
+        let r2_off = 472;
+        quote[r2_off..r2_off + 48].copy_from_slice(&[30u8; 48]);
+        let r3_off = 520;
+        quote[r3_off..r3_off + 48].copy_from_slice(&[40u8; 48]);
 
-        // Set rtmr1 field (bytes 424..472) to [20u8; 48]
-        let rtmr1_offset = 424;
-        quote[rtmr1_offset..rtmr1_offset + 48].copy_from_slice(&[20u8; 48]);
+        // report_data:
+        let rd_off = quote_len - 64;
+        // 32-byte pubkey stub:
+        for i in rd_off..(rd_off + 32) { quote[i] = 1; }
+        // 16-byte vm_uid
+        quote[rd_off + 32..rd_off + 48].copy_from_slice(&vm_uid_bytes);
 
-        // Set rtmr2 field (bytes 472..520) to [30u8; 48]
-        let rtmr2_offset = 472;
-        quote[rtmr2_offset..rtmr2_offset + 48].copy_from_slice(&[30u8; 48]);
-
-        // Set rtmr3 field (bytes 520..568) to [40u8; 48]
-        let rtmr3_offset = 520;
-        quote[rtmr3_offset..rtmr3_offset + 48].copy_from_slice(&[40u8; 48]);
-
-        // Fill report_data (bytes 568..632) first 32 bytes with non-zero values (required for extracting a public key)
-        let report_data_offset = 568;
-        for i in report_data_offset..(report_data_offset + 32) {
-            quote[i] = 1;
-        }
-
-        // Create a dummy collateral (content not used in this test)
         let collateral = vec![0u8; 10];
+        let res_bin = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByImage { quote, collateral }
+        ).unwrap();
+        let resp: EnvSecretResponse = from_binary(&res_bin).unwrap();
 
-        // Query
-        let query_msg = QueryMsg::GetEnvByImage {
-            quote: quote.clone(),
-            collateral: collateral.clone(),
+        assert!(!resp.encrypted_secrets_plaintext.is_empty());
+        assert!(hex::decode(&resp.encrypted_secrets_plaintext).is_ok());
+        assert!(!resp.encryption_pub_key.is_empty());
+        assert!(hex::decode(&resp.encryption_pub_key).is_ok());
+    }
+
+    #[test]
+    fn get_env_by_image_from_file_returns_secret() {
+        use std::fs;
+        use std::path::Path;
+        use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+        use cosmwasm_std::{from_binary, StdError};
+        use hex;
+
+        // --- Setup contract and admin ---
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {})
+            .expect("instantiate should succeed");
+
+        // --- Step 1. Read quote & collateral from files ---
+        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt"))
+            .expect("reading quote.txt")
+            .trim()
+            .to_string();
+        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt"))
+            .expect("reading collateral.txt")
+            .trim()
+            .to_string();
+
+        let quote = hex::decode(&quote_hex).expect("decode quote hex");
+        let collateral = hex::decode(&collateral_hex).expect("decode collateral hex");
+
+        // --- Step 2. Parse the TDX attestation ---
+        let tdx = parse_tdx_attestation(&quote, &collateral)
+            .expect("attestation should parse");
+
+        // --- Step 3. Extract the VM UID from report_data[32..48] ---
+        let vm_uid_hex = hex::encode(&tdx.report_data[32..48]);
+
+        // --- Step 4. Add the env secret, using the real fields from the quote ---
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(tdx.mr_td.to_vec()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: Some(tdx.rtmr1.to_vec()),
+            rtmr2: Some(tdx.rtmr2.to_vec()),
+            rtmr3: Some(tdx.rtmr3.to_vec()),
+            vm_uid: Some(vm_uid_hex.clone()),
         };
-        let res_bin = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            ExecuteMsg::AddEnvByImage {
+                image_filter: image_filter.clone(),
+                secrets_plaintext: "env_secret_plaintext".to_string(),
+            },
+        )
+            .expect("AddEnvByImage must succeed");
+
+        // --- Step 5. Query GetEnvByImage and verify ---
+        let res_bin = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByImage { quote: quote.clone(), collateral: collateral.clone() },
+        )
+            .expect("query GetEnvByImage");
         let resp: EnvSecretResponse = from_binary(&res_bin).unwrap();
 
         println!("resp: {:#?}", resp);
 
-        // Should be non‐empty hex and valid hex
-        assert!(!resp.encrypted_secrets_plaintext.is_empty());
-        assert!(hex::decode(&resp.encrypted_secrets_plaintext).is_ok());
-
-        // And the public key string:
-        assert!(!resp.encryption_pub_key.is_empty());
-        assert!(hex::decode(&resp.encryption_pub_key).is_ok());
+        // both fields should be non‐empty and valid hex
+        assert!(!resp.encrypted_secrets_plaintext.is_empty(), "encrypted_secrets_plaintext must not be empty");
+        assert!(hex::decode(&resp.encrypted_secrets_plaintext).is_ok(), "must be valid hex");
+        assert!(!resp.encryption_pub_key.is_empty(), "encryption_pub_key must not be empty");
+        assert!(hex::decode(&resp.encryption_pub_key).is_ok(), "must be valid hex");
     }
 
     #[test]
@@ -1263,6 +1318,37 @@ mod tests {
         );
 
         println!("SecretCLI command: {}", command);
+    }
+
+    #[test]
+    fn dump_report_data_from_quote_file() {
+        // Read the quote and collateral hex strings from disk
+        let quote_path = Path::new("tests/quote.txt");
+        let collateral_path = Path::new("tests/collateral.txt");
+        let quote_hex = fs::read_to_string(quote_path)
+            .expect("Failed to read tests/quote.txt");
+        let collateral_hex = fs::read_to_string(collateral_path)
+            .expect("Failed to read tests/collateral.txt");
+
+        // Decode the hex into raw bytes
+        let quote = hex::decode(quote_hex.trim())
+            .expect("Failed to decode quote hex");
+        let collateral = hex::decode(collateral_hex.trim())
+            .expect("Failed to decode collateral hex");
+
+        // Parse the TDX attestation
+        let tdx = parse_tdx_attestation(&quote, &collateral)
+            .expect("Quote verification or parsing failed");
+
+        // Extract report_data and encode it as hex
+        let report_data = &tdx.report_data;
+        let report_data_hex = hex::encode(report_data);
+
+        // Print the hex-encoded report_data for inspection
+        println!("report_data: {}", report_data_hex);
+
+        // Assert that report_data is non-empty
+        assert!(!report_data_hex.is_empty(), "report_data should not be empty");
     }
 
 }
