@@ -19,7 +19,7 @@ pub struct MsgImageFilter {
     pub rtmr2: Option<Vec<u8>>,
     pub rtmr3: Option<Vec<u8>>,
     /// A unique identifier for the VM.  This must be supplied and will be included in key derivation.
-    pub vm_uid: Option<String>,
+    pub vm_uid: Option<Vec<u8>>,
 }
 
 /// Execute messages for the contract.

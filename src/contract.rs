@@ -229,7 +229,7 @@ pub fn try_add_env_by_image(
         rtmr1: image_filter.rtmr1.clone().unwrap(),
         rtmr2: image_filter.rtmr2.clone().unwrap(),
         rtmr3: image_filter.rtmr3.clone().unwrap(),
-        vm_uid: vm_uid.clone(),
+        vm_uid: Some(vm_uid),
         secrets_plaintext: secrets_plaintext.clone(),
     };
 
@@ -299,7 +299,7 @@ pub fn try_add_secret_key_by_image(
     ser.extend(&rtmr3);
 
     // Include VM uid bytes in the hash
-    ser.extend(vm_uid.as_bytes());
+    ser.extend(&vm_uid);
 
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &ser);
@@ -679,17 +679,31 @@ pub fn try_get_env_by_image(
     let r3    = tdx.rtmr3.to_vec();
 
     // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
-    let vm_uid = hex::encode(&tdx.report_data[32..48]);
+    let vm_uid = tdx.report_data[32..48].to_vec();
 
-    // Find the EnvSecret
-    let list = env_secrets_read(deps.storage).load()?;
-    let secret_plain = list.into_iter().find_map(|e| {
-        if e.mr_td == mr_td && e.rtmr1 == r1 && e.rtmr2 == r2 && e.rtmr3 == r3 && e.vm_uid == vm_uid{
-            Some(e.secrets_plaintext)
-        } else {
-            None
-        }
-    }).ok_or_else(|| StdError::generic_err("No env secret found"))?;
+    // Prepare a default empty‐UID for legacy entries
+    let default_vm_uid = vec![0u8; 16];
+
+    // Load all env secrets and find the one that matches,
+    // treating `None` as 16 zero bytes.
+    let secret_plain = env_secrets_read(deps.storage)
+        .load()?
+        .into_iter()
+        .find_map(|e| {
+            // unwrap_or default to sixteen zero bytes
+            let stored_uid = e.vm_uid.unwrap_or_else(|| default_vm_uid.clone());
+            if e.mr_td == mr_td
+                && e.rtmr1 == r1
+                && e.rtmr2 == r2
+                && e.rtmr3 == r3
+                && stored_uid == vm_uid
+            {
+                Some(e.secrets_plaintext)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| StdError::generic_err("No env secret found"))?;
 
     // Encrypt that plaintext
     let other_pub: [u8;32] = tdx.report_data[0..32].try_into()
@@ -970,7 +984,7 @@ mod tests {
         let tdx = parse_tdx_attestation(&quote, &collateral).expect("quote invalid");
 
         // Extract vm_uid from report_data bytes [32..48]
-        let vm_uid_hex = hex::encode(&tdx.report_data[32..48]);
+        let vm_uid = tdx.report_data[32..48].to_vec();
 
         // Build filter including that vm_uid
         let image_filter = MsgImageFilter {
@@ -984,7 +998,7 @@ mod tests {
             rtmr1: Some(tdx.rtmr1.to_vec()),
             rtmr2: Some(tdx.rtmr2.to_vec()),
             rtmr3: Some(tdx.rtmr3.to_vec()),
-            vm_uid: Some(vm_uid_hex.clone()),
+            vm_uid: Some(vm_uid.clone()),
         };
 
         // Store the secret key for this image
@@ -1125,7 +1139,7 @@ mod tests {
             rtmr1: Some(vec![20u8; 48]),
             rtmr2: Some(vec![30u8; 48]),
             rtmr3: Some(vec![40u8; 48]),
-            vm_uid: Some(TEST_VM_UID_HEX.into()),
+            vm_uid: Some(vm_uid_bytes.clone()),
         };
         execute(
             deps.as_mut(),
@@ -1205,7 +1219,7 @@ mod tests {
             .expect("attestation should parse");
 
         // --- Step 3. Extract the VM UID from report_data[32..48] ---
-        let vm_uid_hex = hex::encode(&tdx.report_data[32..48]);
+        let vm_uid = tdx.report_data[32..48].to_vec();
 
         // --- Step 4. Add the env secret, using the real fields from the quote ---
         let image_filter = MsgImageFilter {
@@ -1219,7 +1233,7 @@ mod tests {
             rtmr1: Some(tdx.rtmr1.to_vec()),
             rtmr2: Some(tdx.rtmr2.to_vec()),
             rtmr3: Some(tdx.rtmr3.to_vec()),
-            vm_uid: Some(vm_uid_hex.clone()),
+            vm_uid: Some(vm_uid),
         };
         execute(
             deps.as_mut(),
