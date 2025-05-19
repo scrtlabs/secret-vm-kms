@@ -276,10 +276,6 @@ pub fn try_add_secret_key_by_image(
         return Err(StdError::generic_err("Only the contract admin can add a secret key by image"));
     }
 
-    // Extract the VM UID (required)
-    let vm_uid = image_filter.vm_uid
-        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
-
 
     // Pull out just the four required fields (error if any missing)
     let mr_td    = image_filter.mr_td
@@ -297,9 +293,6 @@ pub fn try_add_secret_key_by_image(
     ser.extend(&rtmr1);
     ser.extend(&rtmr2);
     ser.extend(&rtmr3);
-
-    // Include VM uid bytes in the hash
-    ser.extend(&vm_uid);
 
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &ser);
@@ -615,15 +608,11 @@ pub fn try_get_secret_key_by_image(
     let r2     = tdx.rtmr2.to_vec();
     let r3     = tdx.rtmr3.to_vec();
 
-    // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
-    let vm_uid = hex::encode(&tdx.report_data[32..48]);
-
     let mut hasher = Sha256::new();
     sha2::Digest::update(&mut hasher, &mr_td);
     sha2::Digest::update(&mut hasher, &r1);
     sha2::Digest::update(&mut hasher, &r2);
     sha2::Digest::update(&mut hasher, &r3);
-    sha2::digest::Update::update(&mut hasher, vm_uid.as_bytes());
     let image_key = hasher.finalize().to_vec();
 
     let bucket = image_secret_keys_read(deps.storage);
@@ -986,7 +975,7 @@ mod tests {
         // Extract vm_uid from report_data bytes [32..48]
         let vm_uid = tdx.report_data[32..48].to_vec();
 
-        // Build filter including that vm_uid
+
         let image_filter = MsgImageFilter {
             mr_seam: Some(tdx.mr_seam.to_vec()),
             mr_signer_seam: Some(tdx.mr_signer_seam.to_vec()),
@@ -998,7 +987,7 @@ mod tests {
             rtmr1: Some(tdx.rtmr1.to_vec()),
             rtmr2: Some(tdx.rtmr2.to_vec()),
             rtmr3: Some(tdx.rtmr3.to_vec()),
-            vm_uid: Some(vm_uid.clone()),
+            vm_uid: None,
         };
 
         // Store the secret key for this image
