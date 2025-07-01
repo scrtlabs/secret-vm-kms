@@ -7,10 +7,11 @@ use std::backtrace::Backtrace;
 use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{EnvSecretResponse, ExecuteMsg, InstantiateMsg, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read};
+use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
+use crate::msg::QueryMsg::ListImageFilters;
 
 /// Declaration of tdx_quote_hdr_t and tdx_quote_t as provided.
 /// DO NOT CHANGE THIS CODE.
@@ -137,7 +138,27 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
-        MigrateMsg::Migrate {} => Ok(Response::default()),
+        MigrateMsg::Migrate {} => {
+            // Load the old vector of services
+            let old: Vec<OldService> = services_read(deps.storage).load()?;
+            // Convert each OldService into the new map-based Service
+            for svc in old.into_iter() {
+                let entries: Vec<FilterEntry> = svc
+                    .image_filters
+                    .into_iter()
+                    .map(|f| FilterEntry { filter: f, description: String::new() })
+                    .collect();
+                let new_svc = Service {
+                    id: svc.id.to_string(),
+                    name: svc.name,
+                    admin: svc.admin,
+                    secret_key: svc.secret_key,
+                    filters: entries,
+                };
+                SERVICES_MAP.insert(deps.storage, &new_svc.id, &new_svc)?;
+            }
+            Ok(Response::new().add_attribute("action", "migrate_services"))
+        },
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
 }
@@ -155,10 +176,6 @@ pub fn instantiate(
         admin: info.sender.clone(), // set the global admin to the sender
     };
     global_state(deps.storage).save(&gs)?;
-    let svc_list: Vec<Service> = Vec::new();
-    services(deps.storage).save(&svc_list)?;
-    // Also initialize the bucket for image secret keys (nothing to store initially)
-    // And initialize the environment secrets as an empty vector.
     let env_list: Vec<EnvSecret> = Vec::new();
     env_secrets(deps.storage).save(&env_list)?;
     Ok(Response::default())
@@ -173,13 +190,12 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
     match msg {
-        ExecuteMsg::CreateService { name } => try_create_service(deps, env, info, name),
-        ExecuteMsg::AddImageToService { service_id, image_filter } => {
-            try_add_image(deps, info, service_id, image_filter)
-        }
-        ExecuteMsg::RemoveImageFromService { service_id, image_filter } => {
-            try_remove_image(deps, info, service_id, image_filter)
-        }
+        ExecuteMsg::CreateService { service_id, name } =>
+            try_create_service(deps,env, info, service_id, name),
+        ExecuteMsg::AddImageToService { service_id, image_filter, description } =>
+            try_add_filter(deps, info, service_id, image_filter, description),
+        ExecuteMsg::RemoveImageFromService { service_id, image_filter } =>
+            try_remove_filter(deps, info, service_id, image_filter),
         ExecuteMsg::AddSecretKeyByImage { image_filter } => {
             try_add_secret_key_by_image(deps, env, info, image_filter)
         }
@@ -319,134 +335,129 @@ pub fn try_add_secret_key_by_image(
         .add_attribute("message", "Secret key created"))
 }
 
-/// Handles creating a new service.
-/// Generates secret_key as SHA256(env.block.random + service_id) in hex.
-/// Handles creating a new service (unchanged aside from uniqueness check, if needed).
-pub fn try_create_service(
+/// Create service: generate secret_key via SHA256(env.random + id)
+fn try_create_service(
     deps: DepsMut,
     env: Env,
     info: MessageInfo,
+    service_id: String,
     name: String,
 ) -> StdResult<Response> {
-    let mut gs = global_state(deps.storage).load()?;
-    let mut svc_list = services(deps.storage).load()?;
-
-    // Enforce unique service names.
-    if svc_list.iter().any(|s| s.name == name) {
-        return Err(StdError::generic_err("Service name already exists"));
+    let state = global_state_read(deps.storage).load()?;
+    if info.sender.to_string() != state.admin { return Err(StdError::generic_err("Only admin")); }
+    // Check for existing service_id
+    if SERVICES_MAP.contains(deps.storage, &service_id) {
+        return Err(StdError::generic_err("Service ID exists"));
     }
-
-    let service_id = gs.service_count;
+    // compute secret_key
     let mut hasher = Sha256::new();
     let mut random_bytes = Vec::new();
     for bin in env.block.random.iter() {
         random_bytes.extend_from_slice(bin.as_slice());
     }
     sha2::Digest::update(&mut hasher, &random_bytes);
-    sha2::Digest::update(&mut hasher, &service_id.to_be_bytes());
-    let secret_hash = hasher.finalize();
-    let secret = secret_hash.to_vec();
-
-    let new_service = Service {
-        id: service_id,
-        name: name.clone(),
-        admin: info.sender.clone(),
-        secret_key: secret,
-        image_filters: Vec::new(),
-    };
-
-    svc_list.push(new_service);
-    gs.service_count += 1;
-    global_state(deps.storage).save(&gs)?;
-    services(deps.storage).save(&svc_list)?;
-    Ok(Response::new()
-        .add_attribute("action", "create_service")
-        .add_attribute("service_id", service_id.to_string())
-        .add_attribute("name", name)
-        .add_attribute("admin", info.sender.to_string()))
+    sha2::Digest::update(&mut hasher, service_id.as_bytes());
+    let secret_key = hasher.finalize().to_vec();
+    let svc = Service { id: service_id.clone(), name: name.clone(), admin: state.admin.clone(), secret_key, filters: Vec::new() };
+    SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+    Ok(Response::new().add_attribute("action","create_service").add_attribute("service_id",service_id).add_attribute("name",name))
 }
 
-/// Handles adding an image filter to a service.
-/// The filter contains fields (all Option<Vec<u8>>) corresponding to `tdx_quote_t` fields.
-/// Only the service admin can add.
-pub fn try_add_image(
+/// Add filter
+fn try_add_filter(
     deps: DepsMut,
     info: MessageInfo,
-    service_id: u64,
+    service_id: String,
     image_filter: MsgImageFilter,
+    description: String,
 ) -> StdResult<Response> {
-    let mut svc_list = services(deps.storage).load()?;
-    let filter_str = {
-        let service = svc_list.iter_mut().find(|s| s.id == service_id)
-            .ok_or_else(|| StdError::generic_err("Service not found"))?;
-        if info.sender != service.admin {
-            return Err(StdError::generic_err("Only the service admin can add image filter"));
-        }
-        service.image_filters.push(ImageFilter {
-            mr_seam: image_filter.mr_seam,
-            mr_signer_seam: image_filter.mr_signer_seam,
-            mr_td: image_filter.mr_td,
-            mr_config_id: image_filter.mr_config_id,
-            mr_owner: image_filter.mr_owner,
-            mr_config: image_filter.mr_config,
-            rtmr0: image_filter.rtmr0,
-            rtmr1: image_filter.rtmr1,
-            rtmr2: image_filter.rtmr2,
-            rtmr3: image_filter.rtmr3,
-        });
-        serde_json::to_string(&service.image_filters.last().unwrap()).unwrap_or_default()
+    // Fetch service or error
+    let mut svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
+    // Only admin may add
+    if info.sender.to_string() != svc.admin {
+        return Err(StdError::generic_err("Only the service admin can add image filter"));
+    }
+    // Convert MsgImageFilter to state::ImageFilter
+    let entry_filter = ImageFilter {
+        mr_seam: image_filter.mr_seam.clone(),
+        mr_signer_seam: image_filter.mr_signer_seam.clone(),
+        mr_td: image_filter.mr_td.clone(),
+        mr_config_id: image_filter.mr_config_id.clone(),
+        mr_owner: image_filter.mr_owner.clone(),
+        mr_config: image_filter.mr_config.clone(),
+        rtmr0: image_filter.rtmr0.clone(),
+        rtmr1: image_filter.rtmr1.clone(),
+        rtmr2: image_filter.rtmr2.clone(),
+        rtmr3: image_filter.rtmr3.clone(),
     };
-    services(deps.storage).save(&svc_list)?;
+    // Add new filter entry
+    svc.filters.push(FilterEntry { filter: entry_filter.clone(), description: description.clone() });
+    // Persist updated service
+    SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+    // Prepare a JSON string of the filter for the event
+    let filter_str = serde_json::to_string(&entry_filter).unwrap_or_default();
+    // Build response including attributes and event
     Ok(Response::new()
         .add_attribute("action", "add_image_to_service")
-        .add_attribute("service_id", service_id.to_string())
+        .add_attribute("service_id", service_id.clone())
+        .add_attribute("description", description.clone())
         .add_event(
             Event::new("add_image_to_service")
-                .add_attribute_plaintext("service_id", service_id.to_string())
+                .add_attribute_plaintext("service_id", service_id.clone())
                 .add_attribute_plaintext("admin", info.sender.to_string())
-                .add_attribute_plaintext("Image", filter_str)
-        ))
+                .add_attribute_plaintext("image", filter_str)
+                .add_attribute_plaintext("description", description)
+        )
+    )
 }
 
-/// Handles removing an image filter from a service.
-/// Exact match is required for removal.
-pub fn try_remove_image(
+/// Remove filter: exact match required, emit event like before
+fn try_remove_filter(
     deps: DepsMut,
     info: MessageInfo,
-    service_id: u64,
+    service_id: String,
     image_filter: MsgImageFilter,
 ) -> StdResult<Response> {
-    let mut svc_list = services(deps.storage).load()?;
-    let service = svc_list.iter_mut().find(|s| s.id == service_id)
+    // Fetch service or error
+    let mut svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
-    if info.sender != service.admin {
-        return Err(StdError::generic_err("Only the service admin can remove image filter"));
+    // Only admin may remove
+    if info.sender.to_string() != svc.admin {
+        return Err(StdError::generic_err("Only admin"));
     }
-    let original_len = service.image_filters.len();
-    service.image_filters.retain(|img| {
-        !(img.mr_seam == image_filter.mr_seam &&
-            img.mr_signer_seam == image_filter.mr_signer_seam &&
-            img.mr_td == image_filter.mr_td &&
-            img.mr_config_id == image_filter.mr_config_id &&
-            img.mr_owner == image_filter.mr_owner &&
-            img.mr_config == image_filter.mr_config &&
-            img.rtmr0 == image_filter.rtmr0 &&
-            img.rtmr1 == image_filter.rtmr1 &&
-            img.rtmr2 == image_filter.rtmr2 &&
-            img.rtmr3 == image_filter.rtmr3)
-    });
-    if service.image_filters.len() == original_len {
-        return Err(StdError::generic_err("Image filter with given parameters not found"));
+    // Convert MsgImageFilter into state::ImageFilter for comparison
+    let removal_filter = ImageFilter {
+        mr_seam: image_filter.mr_seam.clone(),
+        mr_signer_seam: image_filter.mr_signer_seam.clone(),
+        mr_td: image_filter.mr_td.clone(),
+        mr_config_id: image_filter.mr_config_id.clone(),
+        mr_owner: image_filter.mr_owner.clone(),
+        mr_config: image_filter.mr_config.clone(),
+        rtmr0: image_filter.rtmr0.clone(),
+        rtmr1: image_filter.rtmr1.clone(),
+        rtmr2: image_filter.rtmr2.clone(),
+        rtmr3: image_filter.rtmr3.clone(),
+    };
+    let original_len = svc.filters.len();
+    svc.filters.retain(|entry| entry.filter != removal_filter);
+    if svc.filters.len() == original_len {
+        return Err(StdError::generic_err("Filter not found"));
     }
-    services(deps.storage).save(&svc_list)?;
+    // Persist
+    SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+    // Prepare JSON for event
+    let filter_str = serde_json::to_string(&removal_filter).unwrap_or_default();
     Ok(Response::new()
         .add_attribute("action", "remove_image_from_service")
-        .add_attribute("service_id", service_id.to_string())
+        .add_attribute("service_id", service_id.clone())
         .add_event(
             Event::new("remove_image_from_service")
-                .add_attribute_plaintext("service_id", service_id.to_string())
+                .add_attribute_plaintext("service_id", service_id.clone())
                 .add_attribute_plaintext("admin", info.sender.to_string())
-                .add_attribute_plaintext("Image", serde_json::to_string(&image_filter).unwrap_or_default())
+                .add_attribute_plaintext("filter", filter_str)
         )
     )
 }
@@ -499,98 +510,59 @@ fn encrypt_secret(
 pub fn try_get_secret_key(
     deps: Deps,
     env: Env,
-    service_id: u64,
+    service_id: String,
     quote: Vec<u8>,
     collateral: Vec<u8>,
 ) -> StdResult<SecretKeyResponse> {
-    let svc_list = services_read(deps.storage).load()?;
-    let service = svc_list.into_iter().find(|s| s.id == service_id)
+    // Load service
+    let svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
-    let tdx_quote = parse_tdx_attestation(&quote, &collateral)
-        .ok_or_else(|| StdError::generic_err("Attestation verification failed or quote invalid"))?;
-
-    // println!("tdx_quote: {:#?}", tdx_quote);
-
-    // Convert fixed arrays from tdx_quote to Vec<u8> for comparison.
-    let tdx_mr_seam = tdx_quote.mr_seam.to_vec();
-    let tdx_mr_signer_seam = tdx_quote.mr_signer_seam.to_vec();
-    let tdx_mr_td = tdx_quote.mr_td.to_vec();
-    let tdx_mr_config_id = tdx_quote.mr_config_id.to_vec();
-    let tdx_mr_owner = tdx_quote.mr_owner.to_vec();
-    let tdx_mr_config = tdx_quote.mr_config.to_vec();
-    let tdx_rtmr0 = tdx_quote.rtmr0.to_vec();
-    let tdx_rtmr1 = tdx_quote.rtmr1.to_vec();
-    let tdx_rtmr2 = tdx_quote.rtmr2.to_vec();
-    let tdx_rtmr3 = tdx_quote.rtmr3.to_vec();
-    let tdx_report_data = tdx_quote.report_data.to_vec();
-
-    let mut match_found = false;
-    'outer: for filter in service.image_filters.iter() {
-        if let Some(ref permitted) = filter.mr_seam {
-            if permitted.len() != tdx_mr_seam.len() || permitted != &tdx_mr_seam {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.mr_signer_seam {
-            if permitted.len() != tdx_mr_signer_seam.len() || permitted != &tdx_mr_signer_seam {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.mr_td {
-            if permitted.len() != tdx_mr_td.len() || permitted != &tdx_mr_td {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.mr_config_id {
-            if permitted.len() != tdx_mr_config_id.len() || permitted != &tdx_mr_config_id {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.mr_owner {
-            if permitted.len() != tdx_mr_owner.len() || permitted != &tdx_mr_owner {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.mr_config {
-            if permitted.len() != tdx_mr_config.len() || permitted != &tdx_mr_config {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.rtmr0 {
-            if permitted.len() != tdx_rtmr0.len() || permitted != &tdx_rtmr0 {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.rtmr1 {
-            if permitted.len() != tdx_rtmr1.len() || permitted != &tdx_rtmr1 {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.rtmr2 {
-            if permitted.len() != tdx_rtmr2.len() || permitted != &tdx_rtmr2 {
-                continue 'outer;
-            }
-        }
-        if let Some(ref permitted) = filter.rtmr3 {
-            if permitted.len() != tdx_rtmr3.len() || permitted != &tdx_rtmr3 {
-                continue 'outer;
-            }
-        }
-        // All specified fields in this filter match.
-        match_found = true;
+    // Verify and parse attestation
+    let tdx = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Invalid attestation"))?;
+    // Convert fields
+    let t_mr_seam = tdx.mr_seam.to_vec();
+    let t_mr_signer = tdx.mr_signer_seam.to_vec();
+    let t_mr_td = tdx.mr_td.to_vec();
+    let t_mr_config_id = tdx.mr_config_id.to_vec();
+    let t_mr_owner = tdx.mr_owner.to_vec();
+    let t_mr_config = tdx.mr_config.to_vec();
+    let t_rtmr0 = tdx.rtmr0.to_vec();
+    let t_rtmr1 = tdx.rtmr1.to_vec();
+    let t_rtmr2 = tdx.rtmr2.to_vec();
+    let t_rtmr3 = tdx.rtmr3.to_vec();
+    // Match stored filters
+    let mut found = false;
+    for entry in svc.filters.iter() {
+        let f = &entry.filter;
+        if let Some(ref p) = f.mr_seam         { if p != &t_mr_seam       { continue; } }
+        if let Some(ref p) = f.mr_signer_seam  { if p != &t_mr_signer     { continue; } }
+        if let Some(ref p) = f.mr_td           { if p != &t_mr_td         { continue; } }
+        if let Some(ref p) = f.mr_config_id    { if p != &t_mr_config_id  { continue; } }
+        if let Some(ref p) = f.mr_owner        { if p != &t_mr_owner      { continue; } }
+        if let Some(ref p) = f.mr_config       { if p != &t_mr_config     { continue; } }
+        if let Some(ref p) = f.rtmr0           { if p != &t_rtmr0         { continue; } }
+        if let Some(ref p) = f.rtmr1           { if p != &t_rtmr1         { continue; } }
+        if let Some(ref p) = f.rtmr2           { if p != &t_rtmr2         { continue; } }
+        if let Some(ref p) = f.rtmr3           { if p != &t_rtmr3         { continue; } }
+        found = true;
         break;
     }
-    if !match_found {
-        return Err(StdError::generic_err("Attestation parameters do not match any permitted image"));
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
     }
-    let secret_key = service.secret_key;
-    // Extract the first 32 bytes from report_data to serve as the "other" public key.
-    let other_pub_key: [u8; 32] = tdx_quote.report_data[0..32]
+    // Encrypt secret key
+    let secret_key = svc.secret_key.clone();
+    let other_pub: [u8;32] = tdx.report_data[0..32]
         .try_into()
-        .map_err(|_| StdError::generic_err("Failed to extract public key from report_data"))?;
-    // Encrypt the service secret key using the new helper function.
-    let encrypted_secret_key_response = encrypt_secret(secret_key, other_pub_key,quote.as_slice(),env.block.height.to_string().into_bytes())?;
-    Ok(encrypted_secret_key_response)
+        .map_err(|_| StdError::generic_err("Invalid report_data"))?;
+    encrypt_secret(
+        secret_key,
+        other_pub,
+        &quote,
+        env.block.height.to_string().into_bytes(),
+    )
 }
 
 pub fn try_get_secret_key_by_image(
@@ -645,7 +617,37 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetEnvByImage { quote, collateral } => {
             to_binary(&try_get_env_by_image(deps, env, quote, collateral)?)
         }
+        /// Return filters (with descriptions) for a service
+        ListImageFilters { service_id} =>  {
+            to_binary(&query_image_filters(deps, service_id)?)
+        }
     }
+}
+
+/// Query image filters, returning hex-encoded image fields
+fn query_image_filters(deps: Deps, service_id: String) -> StdResult<ListImageResponse> {
+    let svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
+    let list = svc.filters.iter().map(|entry| {
+        let f = &entry.filter;
+        ImageFilterHexEntry {
+            filter: ImageFilterHex {
+                mr_seam: f.mr_seam.as_ref().map(|b| hex::encode(b)),
+                mr_signer_seam: f.mr_signer_seam.as_ref().map(|b| hex::encode(b)),
+                mr_td: f.mr_td.as_ref().map(|b| hex::encode(b)),
+                mr_config_id: f.mr_config_id.as_ref().map(|b| hex::encode(b)),
+                mr_owner: f.mr_owner.as_ref().map(|b| hex::encode(b)),
+                mr_config: f.mr_config.as_ref().map(|b| hex::encode(b)),
+                rtmr0: f.rtmr0.as_ref().map(|b| hex::encode(b)),
+                rtmr1: f.rtmr1.as_ref().map(|b| hex::encode(b)),
+                rtmr2: f.rtmr2.as_ref().map(|b| hex::encode(b)),
+                rtmr3: f.rtmr3.as_ref().map(|b| hex::encode(b)),
+            },
+            description: entry.description.clone(),
+        }
+    }).collect();
+    Ok(ListImageResponse { filters: list })
 }
 
 /// NEW: Retrieve the environment secret using an attestation.
@@ -709,25 +711,24 @@ pub fn try_get_env_by_image(
 }
 
 /// Returns information about a service by its ID.
-fn query_service(deps: Deps, id: u64) -> StdResult<ServiceResponse> {
-    let svc_list = services_read(deps.storage).load()?;
-    let service = svc_list.into_iter().find(|s| s.id == id)
+fn query_service(deps: Deps, id: String) -> StdResult<ServiceResponse> {
+    let svc = SERVICES_MAP
+        .get(deps.storage, &id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
-    Ok(ServiceResponse {
-        id: service.id,
-        name: service.name,
-        admin: service.admin.to_string(),
-    })
+    Ok(ServiceResponse { id: svc.id, name: svc.name, admin: svc.admin.into_string() })
 }
 
 /// Returns a list of all services.
 fn query_services(deps: Deps) -> StdResult<Vec<ServiceResponse>> {
-    let svc_list = services_read(deps.storage).load()?;
-    let resp: Vec<ServiceResponse> = svc_list.into_iter().map(|s| ServiceResponse {
-        id: s.id,
-        name: s.name,
-        admin: s.admin.to_string(),
-    }).collect();
+    let mut resp: Vec<ServiceResponse> = Vec::new();
+    for result in SERVICES_MAP.iter(deps.storage)? {
+        let (_key, svc) = result?;
+        resp.push(ServiceResponse {
+            id: svc.id.clone(),
+            name: svc.name.clone(),
+            admin: svc.admin.clone().into_string(),
+        });
+    }
     Ok(resp)
 }
 
@@ -767,11 +768,23 @@ mod tests {
         let mut deps = mock_dependencies();
         let info = mock_info("creator", &[]);
         let init_msg = InstantiateMsg {};
-        let _ = instantiate(deps.as_mut(), mock_env(), info.clone(), init_msg).unwrap();
-        let exec_msg = ExecuteMsg::CreateService { name: "TestService".to_string() };
+        instantiate(deps.as_mut(), mock_env(), info.clone(), init_msg).unwrap();
+
+        // Now include service_id in the CreateService call
+        let exec_msg = ExecuteMsg::CreateService {
+            service_id: "0".to_string(),
+            name: "TestService".to_string(),
+        };
         let res = execute(deps.as_mut(), mock_env(), info.clone(), exec_msg).unwrap();
         assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "create_service"));
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetService { id: 0 }).unwrap();
+
+        // Query by numeric ID 0
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetService { id: "0".to_string() },
+        )
+            .unwrap();
         let service: ServiceResponse = from_binary(&res).unwrap();
         assert_eq!(service.name, "TestService");
         assert_eq!(service.admin, "creator");
@@ -783,7 +796,7 @@ mod tests {
         let admin_info = mock_info("admin", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService { name: "ServiceWithImage".to_string() };
+        let create_msg = ExecuteMsg::CreateService {service_id: "0".to_string(), name: "ServiceWithImage".to_string() };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         let image_filter = MsgImageFilter {
             mr_seam: None,
@@ -798,10 +811,10 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter: image_filter.clone() };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter: image_filter.clone(), description: "TestImage".to_string() };
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
         assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_image_to_service"));
-        let remove_msg = ExecuteMsg::RemoveImageFromService { service_id: 0, image_filter };
+        let remove_msg = ExecuteMsg::RemoveImageFromService { service_id: "0".to_string(), image_filter };
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), remove_msg).unwrap();
         assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "remove_image_from_service"));
     }
@@ -812,7 +825,7 @@ mod tests {
         let admin_info = mock_info("admin", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService { name: "ServiceForKey".to_string() };
+        let create_msg = ExecuteMsg::CreateService { name: "ServiceForKey".to_string(), service_id: "0".to_string() };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         // Add an image filter that specifies mr_td must equal a specific vector of 48 bytes.
         let mut expected_mr_td = vec![0u8;48];
@@ -830,7 +843,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter, description: "TestImage".to_string() };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
         // Construct a dummy quote buffer of size_of::<tdx_quote_t>()
         let quote_len = mem::size_of::<tdx_quote_t>();
@@ -853,7 +866,7 @@ mod tests {
         quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
         // Dummy collateral
         let collateral = vec![0u8; 10];
-        let get_msg = QueryMsg::GetSecretKey { service_id: 0, quote: quote.clone(), collateral: collateral.clone() };
+        let get_msg = QueryMsg::GetSecretKey { service_id: "0".to_string(), quote: quote.clone(), collateral: collateral.clone() };
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!secret_key.encrypted_secret_key.is_empty());
@@ -883,7 +896,7 @@ mod tests {
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
 
         // Create a new service.
-        let create_msg = ExecuteMsg::CreateService { name: "ServiceForFileKey".to_string() };
+        let create_msg = ExecuteMsg::CreateService { name: "ServiceForFileKey".to_string(), service_id: "0".to_string()};
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
 
         // Add an image filter that accepts any quote (all fields are None).
@@ -900,11 +913,11 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
 
         // Query the secret key using the quote and collateral read from file.
-        let get_msg = QueryMsg::GetSecretKey { service_id: 0, quote, collateral };
+        let get_msg = QueryMsg::GetSecretKey { service_id: "0".to_string(), quote, collateral };
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
 
@@ -925,7 +938,7 @@ mod tests {
         let other_info = mock_info("other", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService { name: "UnauthorizedTest".to_string() };
+        let create_msg = ExecuteMsg::CreateService { name: "UnauthorizedTest".to_string(), service_id: "0".to_string() };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         let image_filter = MsgImageFilter {
             mr_seam: None,
@@ -940,7 +953,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: 0, image_filter };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter };
         let res = execute(deps.as_mut(), mock_env(), other_info.clone(), add_msg);
         match res {
             Err(StdError::GenericErr { msg, .. }) => {
@@ -948,6 +961,68 @@ mod tests {
             },
             _ => panic!("Expected unauthorized error"),
         }
+    }
+
+    #[test]
+    fn list_image_filters_returns_hex() {
+        let mut deps = mock_dependencies();
+        let info = mock_info("admin", &[]);
+        // Instantiate contract
+        instantiate(deps.as_mut(), mock_env(), info.clone(), InstantiateMsg {}).unwrap();
+
+        // Create a service with ID "1"
+        let svc_id = "1".to_string();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            info.clone(),
+            ExecuteMsg::CreateService { service_id: svc_id.clone(), name: "Svc".to_string() },
+        ).unwrap();
+
+        // Add an image filter with known bytes and description
+        let filter_bytes = vec![1u8, 2, 3];
+        let msg_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(filter_bytes.clone()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+            vm_uid: None,
+        };
+        let desc = "test-desc".to_string();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            info.clone(),
+            ExecuteMsg::AddImageToService {
+                service_id: svc_id.clone(),
+                image_filter: msg_filter.clone(),
+                description: desc.clone(),
+            },
+        ).unwrap();
+
+        // Query the list of filters
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::ListImageFilters { service_id: svc_id.clone() },
+        ).unwrap();
+        let resp: ListImageResponse = from_binary(&res).unwrap();
+
+        println!("Resp: {:#?}", resp);
+
+        // Expect exactly one filter
+        assert_eq!(resp.filters.len(), 1);
+        // Check description
+        assert_eq!(resp.filters[0].description, desc);
+        // Check hex encoding of mr_td
+        let hex_td = hex::encode(&filter_bytes);
+        assert_eq!(resp.filters[0].filter.mr_td.as_ref().unwrap(), &hex_td);
     }
 
     #[test]

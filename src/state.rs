@@ -2,10 +2,12 @@ use cosmwasm_std::{Addr, StdResult, Storage};
 use cosmwasm_storage::{singleton, singleton_read, ReadonlySingleton, Singleton};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use secret_toolkit::storage::Keymap;
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
-static SERVICES_KEY: &[u8] = b"services";
-// NEW: Key for storing env secrets.
+const OLD_SERVICES_KEY: &[u8] = b"services";  // old singleton<Vec<OldService>>
+pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(b"services_map");
+
 pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
 
 // NEW: import bucket helpers
@@ -58,19 +60,28 @@ pub struct ImageFilter {
     pub rtmr3: Option<Vec<u8>>,
 }
 
-/// Structure representing a service.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct OldService {
+    pub id: u64,
+    pub name: String,
+    pub admin: cosmwasm_std::Addr,
+    pub secret_key: Vec<u8>,
+    pub image_filters: Vec<ImageFilter>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct FilterEntry {
+    pub filter: ImageFilter,
+    pub description: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Service {
-    /// Unique identifier for the service.
-    pub id: u64,
-    /// Name of the service.
+    pub id: String,
     pub name: String,
-    /// Address of the service admin (creator).
     pub admin: Addr,
-    /// Secret key for the service.
+    pub filters: Vec<FilterEntry>,
     pub secret_key: Vec<u8>,
-    /// List of image filters (permitted attestation parameters) associated with the service.
-    pub image_filters: Vec<ImageFilter>,
 }
 
 /// Returns a mutable singleton for the global state.
@@ -84,13 +95,13 @@ pub fn global_state_read(storage: &dyn Storage) -> ReadonlySingleton<GlobalState
 }
 
 /// Returns a mutable singleton for the list of services.
-pub fn services(storage: &mut dyn Storage) -> Singleton<Vec<Service>> {
-    singleton(storage, SERVICES_KEY)
+pub fn services(storage: &mut dyn Storage) -> Singleton<Vec<OldService>> {
+    singleton(storage, OLD_SERVICES_KEY)
 }
 
 /// Returns an immutable singleton for the list of services.
-pub fn services_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<Service>> {
-    singleton_read(storage, SERVICES_KEY)
+pub fn services_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<OldService>> {
+    singleton_read(storage, OLD_SERVICES_KEY)
 }
 
 /// NEW: Structure representing an environment secret.
