@@ -139,25 +139,25 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // Load the old vector of services
-            let old: Vec<OldService> = services_read(deps.storage).load()?;
-            // Convert each OldService into the new map-based Service
-            for svc in old.into_iter() {
-                let entries: Vec<FilterEntry> = svc
-                    .image_filters
-                    .into_iter()
-                    .map(|f| FilterEntry { filter: f, description: String::new() })
-                    .collect();
-                let new_svc = Service {
-                    id: svc.id.to_string(),
-                    name: svc.name,
-                    admin: svc.admin,
-                    secret_key: svc.secret_key,
-                    filters: entries,
-                };
-                SERVICES_MAP.insert(deps.storage, &new_svc.id, &new_svc)?;
-            }
-            Ok(Response::new().add_attribute("action", "migrate_services"))
+            // // Load the old vector of services
+            // let old: Vec<OldService> = services_read(deps.storage).load()?;
+            // // Convert each OldService into the new map-based Service
+            // for svc in old.into_iter() {
+            //     let entries: Vec<FilterEntry> = svc
+            //         .image_filters
+            //         .into_iter()
+            //         .map(|f| FilterEntry { filter: f, description: String::new() })
+            //         .collect();
+            //     let new_svc = Service {
+            //         id: svc.id.to_string(),
+            //         name: svc.name,
+            //         admin: svc.admin,
+            //         secret_key: svc.secret_key,
+            //         filters: entries,
+            //     };
+            //     SERVICES_MAP.insert(deps.storage, &new_svc.id, &new_svc)?;
+            // }
+            Ok(Response::new().add_attribute("action", "migrate"))
         },
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -398,19 +398,26 @@ fn try_add_filter(
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
     // Prepare a JSON string of the filter for the event
     let filter_str = serde_json::to_string(&entry_filter).unwrap_or_default();
-    // Build response including attributes and event
-    Ok(Response::new()
+    // Build the event, conditionally adding the description attr
+    let mut ev = Event::new("add_image_to_service")
+        .add_attribute_plaintext("service_id", service_id.clone())
+        .add_attribute_plaintext("admin", info.sender.to_string())
+        .add_attribute_plaintext("image", filter_str);
+
+    if !description.is_empty() {
+        ev = ev.add_attribute_plaintext("description", description.clone());
+    }
+
+    // Build the response, conditionally adding the top‐level attribute too
+    let mut resp = Response::new()
         .add_attribute("action", "add_image_to_service")
-        .add_attribute("service_id", service_id.clone())
-        .add_attribute("description", description.clone())
-        .add_event(
-            Event::new("add_image_to_service")
-                .add_attribute_plaintext("service_id", service_id.clone())
-                .add_attribute_plaintext("admin", info.sender.to_string())
-                .add_attribute_plaintext("image", filter_str)
-                .add_attribute_plaintext("description", description)
-        )
-    )
+        .add_attribute("service_id", service_id.clone());
+
+    if !description.is_empty() {
+        resp = resp.add_attribute("description", description.clone());
+    }
+
+    Ok(resp.add_event(ev))
 }
 
 /// Remove filter: exact match required, emit event like before
