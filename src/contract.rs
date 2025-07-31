@@ -7,8 +7,8 @@ use std::backtrace::Backtrace;
 use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService};
+use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -178,6 +178,9 @@ pub fn instantiate(
     global_state(deps.storage).save(&gs)?;
     let env_list: Vec<EnvSecret> = Vec::new();
     env_secrets(deps.storage).save(&env_list)?;
+    let docker_credentials_list: Vec<DockerCredential> = Vec::new();
+    docker_credentials(deps.storage).save(&docker_credentials_list)?;
+
     Ok(Response::default())
 }
 
@@ -203,8 +206,85 @@ pub fn execute(
         ExecuteMsg::AddEnvByImage { image_filter, secrets_plaintext } => {
             try_add_env_by_image(deps, env, info, image_filter, secrets_plaintext)
         }
+        ExecuteMsg::AddDockerCredentialsByImage { image_filter, username, password_plaintext } => {
+            try_add_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext)
+        }
     }
 }
+
+
+pub fn try_add_docker_credentials_by_image(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    image_filter: MsgImageFilter,
+    username: String,
+    password_plaintext: String,
+) -> StdResult<Response> {
+    // Ensure the sender is the global admin.
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err(
+            "Only the admin can add docker credentials",
+        ));
+    }
+
+    // Extract the VM uid (required)
+    let vm_uid = image_filter.vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+
+    // Check that the required fields are provided.
+    if image_filter.mr_td.is_none()
+        || image_filter.rtmr1.is_none()
+        || image_filter.rtmr2.is_none()
+        || image_filter.rtmr3.is_none()
+    {
+        return Err(StdError::generic_err(
+            "Missing required fields in ImageFilter (mr_td, rtmr1, rtmr2, rtmr3 required)",
+        ));
+    }
+
+    // Create a new DockerCredential structure from the provided image filter.
+    let new_docker_credential = DockerCredential {
+        mr_td: image_filter.mr_td.clone().unwrap(),
+        rtmr1: image_filter.rtmr1.clone().unwrap(),
+        rtmr2: image_filter.rtmr2.clone().unwrap(),
+        rtmr3: image_filter.rtmr3.clone().unwrap(),
+        vm_uid: Some(vm_uid),
+        docker_username: username.clone(),
+        docker_password_plaintext: password_plaintext.clone(),
+    };
+
+    let mut docker_credentials_list: Vec<DockerCredential> =
+        docker_credentials(deps.storage).load().unwrap_or_else(|_| Vec::new());
+
+    let mut updated = false;
+    for cred in docker_credentials_list.iter_mut() {
+        if cred.mr_td == new_docker_credential.mr_td
+            && cred.rtmr1 == new_docker_credential.rtmr1
+            && cred.rtmr2 == new_docker_credential.rtmr2
+            && cred.rtmr3 == new_docker_credential.rtmr3
+            && cred.vm_uid == new_docker_credential.vm_uid
+        {
+            // Update the credentials.
+            cred.docker_username = username.clone();
+            cred.docker_password_plaintext = password_plaintext.clone();
+            updated = true;
+            break;
+        }
+    }
+
+    if !updated {
+        docker_credentials_list.push(new_docker_credential);
+    }
+
+    docker_credentials(deps.storage).save(&docker_credentials_list)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "add_docker_credentials_by_image")
+        .add_attribute("updated", updated.to_string()))
+}
+
 
 /// NEW: Add or update an environment secret by image.
 /// This function expects that the provided image filter includes non‑None values for
@@ -508,6 +588,49 @@ fn encrypt_secret(
     })
 }
 
+
+fn encrypt_docker_credentials(
+    username_plaintext: String,
+    password_plaintext: String,
+    other_pub_key: [u8; 32],
+    quote: &[u8],
+    height: Vec<u8>,
+) -> StdResult<DockerCredentialsResponse> {
+    // Compute seed = SHA256(quote || other_pub_key || height)
+    let mut hasher = Sha256::new();
+    sha2::Digest::update(&mut hasher, quote);
+    sha2::Digest::update(&mut hasher, &other_pub_key);
+    sha2::Digest::update(&mut hasher, &height);
+    let seed_hash = hasher.finalize();
+    let mut seed = [0u8; SECRET_KEY_SIZE];
+    seed.copy_from_slice(&seed_hash[..]);
+
+    // Create ephemeral key pair using the computed seed.
+    let kp = KeyPair::new_with_seed(seed)
+        .map_err(|_| StdError::generic_err("Failed to generate ephemeral key pair with seed"))?;
+
+    // Compute shared secret using the provided other_pub_key.
+    let shared_key = kp.diffie_hellman(&other_pub_key);
+    let aes_key = crate::crypto::AESKey::new_from_slice(&shared_key);
+
+    // Encrypt username
+    let encrypted_username = aes_key
+        .encrypt_siv(username_plaintext.as_bytes(), None)
+        .map_err(|_| StdError::generic_err("Username encryption failed"))?;
+
+    // Encrypt password
+    let encrypted_password = aes_key
+        .encrypt_siv(password_plaintext.as_bytes(), None)
+        .map_err(|_| StdError::generic_err("Password encryption failed"))?;
+
+    Ok(DockerCredentialsResponse {
+        encrypted_username: hex::encode(encrypted_username),
+        encrypted_password: hex::encode(encrypted_password),
+        encryption_pub_key: hex::encode(kp.get_pubkey()),
+    })
+}
+
+
 /// Handles obtaining the secret key for a service.
 /// It receives two buffers (quote and collateral), parses the TDX attestation using the provided function,
 /// then iterates over stored image filters. For each filter, for every field that is Some,
@@ -624,11 +747,60 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::GetEnvByImage { quote, collateral } => {
             to_binary(&try_get_env_by_image(deps, env, quote, collateral)?)
         }
+        QueryMsg::GetDockerCredentialsByImage { quote, collateral } => {
+            to_binary(&try_get_docker_credentials_by_image(deps, env, quote, collateral)?)
+        }
         /// Return filters (with descriptions) for a service
         ListImageFilters { service_id} =>  {
             to_binary(&query_image_filters(deps, service_id)?)
         }
     }
+}
+
+pub fn try_get_docker_credentials_by_image(
+    deps: Deps,
+    env: Env,
+    quote: Vec<u8>,
+    collateral: Vec<u8>,
+) -> StdResult<DockerCredentialsResponse> {
+    // Verify + parse
+    let tdx = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
+
+    // Extract mr_td, rtmr1, rtmr2, rtmr3
+    let mr_td = tdx.mr_td.to_vec();
+    let r1    = tdx.rtmr1.to_vec();
+    let r2    = tdx.rtmr2.to_vec();
+    let r3    = tdx.rtmr3.to_vec();
+
+    // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
+    let vm_uid = tdx.report_data[32..48].to_vec();
+
+    let docker_credentials_list = docker_credentials_read(deps.storage).load()?;
+    let docker_credential = docker_credentials_list
+        .into_iter()
+        .find(|cred| {
+            cred.mr_td == mr_td
+                && cred.rtmr1 == r1
+                && cred.rtmr2 == r2
+                && cred.rtmr3 == r3
+                && cred.vm_uid.as_ref().unwrap() == &vm_uid
+        })
+        .ok_or_else(|| StdError::generic_err("No docker credentials found for this image"))?;
+
+
+    // Encrypt that plaintext
+    let other_pub: [u8;32] = tdx.report_data[0..32].try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    let height_bytes = env.block.height.to_string().into_bytes();
+
+    encrypt_docker_credentials(
+        docker_credential.docker_username,
+        docker_credential.docker_password_plaintext,
+        other_pub,
+        &quote,
+        height_bytes,
+    )
 }
 
 /// Query image filters, returning hex-encoded image fields
@@ -1436,4 +1608,67 @@ mod tests {
         assert!(!report_data_hex.is_empty(), "report_data should not be empty");
     }
 
+    #[test]
+    fn add_and_get_docker_credentials_by_image() {
+        use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+        use cosmwasm_std::{from_binary, StdError};
+        use hex;
+
+        // Initialize contract
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+
+        // Read quote & collateral from files
+        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt")).unwrap().trim().to_string();
+        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt")).unwrap().trim().to_string();
+        let quote = hex::decode(&quote_hex).unwrap();
+        let collateral = hex::decode(&collateral_hex).unwrap();
+
+        // Parse to get report_data
+        let tdx = parse_tdx_attestation(&quote, &collateral).expect("quote invalid");
+
+        // Extract vm_uid from report_data bytes [32..48]
+        let vm_uid = tdx.report_data[32..48].to_vec();
+
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(tdx.mr_td.to_vec()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: Some(tdx.rtmr1.to_vec()),
+            rtmr2: Some(tdx.rtmr2.to_vec()),
+            rtmr3: Some(tdx.rtmr3.to_vec()),
+            vm_uid: Some(vm_uid),
+        };
+
+        // Add the docker credentials
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            ExecuteMsg::AddDockerCredentialsByImage {
+                image_filter: image_filter.clone(),
+                username: "testuser".to_string(),
+                password_plaintext: "testpassword".to_string(),
+            },
+        ).unwrap();
+
+        // Now query by image
+        let query_bin = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetDockerCredentialsByImage { quote: quote.clone(), collateral: collateral.clone() }
+        ).unwrap();
+
+        let resp: DockerCredentialsResponse = from_binary(&query_bin).unwrap();
+
+        // Should have all fields non-empty
+        assert!(!resp.encrypted_username.is_empty());
+        assert!(!resp.encrypted_password.is_empty());
+        assert!(!resp.encryption_pub_key.is_empty());
+    }
 }

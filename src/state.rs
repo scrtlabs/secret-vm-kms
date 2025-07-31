@@ -9,6 +9,8 @@ const OLD_SERVICES_KEY: &[u8] = b"services";  // old singleton<Vec<OldService>>
 pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(b"services_map");
 
 pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
+pub static DOCKER_CREDENTIALS_KEY: &[u8] = b"docker_credentials";
+
 
 // NEW: import bucket helpers
 use cosmwasm_storage::{bucket, bucket_read, Bucket, ReadonlyBucket};
@@ -33,6 +35,13 @@ pub fn env_secrets(storage: &mut dyn Storage) -> Singleton<Vec<EnvSecret>> {
 /// NEW: Returns an immutable singleton for the list of environment secrets.
 pub fn env_secrets_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<EnvSecret>> {
     singleton_read(storage, ENV_SECRETS_KEY)
+}
+pub fn docker_credentials(storage: &mut dyn Storage) -> Singleton<Vec<DockerCredential>> {
+    singleton(storage, DOCKER_CREDENTIALS_KEY)
+}
+
+pub fn docker_credentials_read(storage: &dyn Storage) -> ReadonlySingleton<Vec<DockerCredential>> {
+    singleton_read(storage, DOCKER_CREDENTIALS_KEY)
 }
 
 /// Global state of the contract which tracks the number of created services.
@@ -113,4 +122,15 @@ pub struct EnvSecret {
     pub rtmr3: Vec<u8>,
     pub vm_uid: Option<Vec<u8>>,
     pub secrets_plaintext: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct DockerCredential {
+    pub mr_td: Vec<u8>,
+    pub rtmr1: Vec<u8>,
+    pub rtmr2: Vec<u8>,
+    pub rtmr3: Vec<u8>,
+    pub vm_uid: Option<Vec<u8>>,
+    pub docker_username: String,
+    pub docker_password_plaintext: String,
 }

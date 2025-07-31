@@ -37,6 +37,11 @@ pub enum ExecuteMsg {
     AddSecretKeyByImage { image_filter: MsgImageFilter },
     /// NEW: Add an env secret by image.
     AddEnvByImage { image_filter: MsgImageFilter, secrets_plaintext: String },
+    AddDockerCredentialsByImage {
+        image_filter: MsgImageFilter,
+        username: String,
+        password_plaintext: String,
+    },
 }
 
 /// Query messages for the contract.
@@ -53,6 +58,10 @@ pub enum QueryMsg {
     GetSecretKeyByImage { quote: Vec<u8>, collateral: Vec<u8> },
     /// NEW: Get env secret by image.
     GetEnvByImage { quote: Vec<u8>, collateral: Vec<u8> },
+    GetDockerCredentialsByImage {
+        quote: Vec<u8>,
+        collateral: Vec<u8>,
+    },
     /// Return filters (with descriptions) for a service
     ListImageFilters { service_id: String },
 }
@@ -111,5 +120,13 @@ pub struct SecretKeyResponse {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct EnvSecretResponse {
     pub encrypted_secrets_plaintext: String,
+    pub encryption_pub_key: String,
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct DockerCredentialsResponse {
+    pub encrypted_username: String,
+    pub encrypted_password: String,
     pub encryption_pub_key: String,
 }
