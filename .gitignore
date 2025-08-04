@@ -19,6 +19,6 @@ command.txt
 # Ignore specific files at any level
 **/contract.wasm
 **/contract.wasm.gz
-**/cargo.lock
+#**/cargo.lock
 **/.DS_Store
 **/.env
