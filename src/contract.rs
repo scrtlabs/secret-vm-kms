@@ -8,7 +8,7 @@ use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
 use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -139,26 +139,38 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // // Load the old vector of services
-            // let old: Vec<OldService> = services_read(deps.storage).load()?;
-            // // Convert each OldService into the new map-based Service
-            // for svc in old.into_iter() {
-            //     let entries: Vec<FilterEntry> = svc
-            //         .image_filters
-            //         .into_iter()
-            //         .map(|f| FilterEntry { filter: f, description: String::new() })
-            //         .collect();
-            //     let new_svc = Service {
-            //         id: svc.id.to_string(),
-            //         name: svc.name,
-            //         admin: svc.admin,
-            //         secret_key: svc.secret_key,
-            //         filters: entries,
-            //     };
-            //     SERVICES_MAP.insert(deps.storage, &new_svc.id, &new_svc)?;
-            // }
-            Ok(Response::new().add_attribute("action", "migrate"))
-        },
+            // Step 1: Read all old records into memory to avoid borrow conflicts
+            let mut buffer: Vec<(String, OldService)> = Vec::new();
+            for item in OLD_SERVICES_MAP.iter(deps.storage)? {
+                let (k, old) = item?;
+                buffer.push((k, old));
+            }
+
+            // Step 2: Insert into the new map and remove from the old map
+            let mut moved = 0u64;
+            for (k, old) in buffer.into_iter() {
+                let new = Service {
+                    id: old.id.clone(),
+                    name: old.name.clone(),
+                    admin: old.admin.clone(),
+                    filters: old.filters.clone(),
+                    secret_key: old.secret_key.clone(),
+                    secrets_plaintext: None, // new field remains empty after migration
+                };
+
+                // Insert the converted service into the new map
+                SERVICES_MAP.insert(deps.storage, &k, &new)?;
+
+                // Remove the old entry to clean up storage
+                OLD_SERVICES_MAP.remove(deps.storage, &k)?;
+
+                moved += 1;
+            }
+
+            Ok(Response::new()
+                .add_attribute("action", "migrate_services_old_to_new")
+                .add_attribute("moved", moved.to_string()))
+        }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
 }
@@ -209,9 +221,35 @@ pub fn execute(
         ExecuteMsg::AddDockerCredentialsByImage { image_filter, username, password_plaintext } => {
             try_add_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext)
         }
+        ExecuteMsg::AddEnvByService { service_id, secrets_plaintext } =>
+            try_add_env_by_service(deps, env, info, service_id, secrets_plaintext),
     }
 }
 
+/// handler for adding service-level secret
+pub fn try_add_env_by_service(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    service_id: String,
+    secrets_plaintext: String,
+) -> StdResult<Response> {
+    // Only admin may add
+    let mut svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender.to_string() != svc.admin {
+        return Err(StdError::generic_err("Only the service admin can add service env secret"));
+    }
+    // store or update secret
+    svc.secrets_plaintext = Some(secrets_plaintext.clone());
+    SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+    Ok(Response::new()
+        .add_attribute("action", "add_env_by_service")
+        .add_attribute("service_id", service_id)
+        .add_attribute("updated", "true"))
+}
 
 pub fn try_add_docker_credentials_by_image(
     deps: DepsMut,
@@ -438,7 +476,7 @@ fn try_create_service(
     sha2::Digest::update(&mut hasher, &random_bytes);
     sha2::Digest::update(&mut hasher, service_id.as_bytes());
     let secret_key = hasher.finalize().to_vec();
-    let svc = Service { id: service_id.clone(), name: name.clone(), admin: state.admin.clone(), secret_key, filters: Vec::new() };
+    let svc = Service { id: service_id.clone(), name: name.clone(), admin: state.admin.clone(), secret_key, filters: Vec::new(), secrets_plaintext: None, };
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
     Ok(Response::new().add_attribute("action","create_service").add_attribute("service_id",service_id).add_attribute("name",name))
 }
@@ -754,7 +792,60 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         ListImageFilters { service_id} =>  {
             to_binary(&query_image_filters(deps, service_id)?)
         }
+        QueryMsg::GetEnvByService { service_id, quote, collateral } =>
+            to_binary(&try_get_env_by_service(deps, env, service_id, quote, collateral)?),
     }
+}
+
+/// handler for retrieving service-level secret
+pub fn try_get_env_by_service(
+    deps: Deps,
+    env: Env,
+    service_id: String,
+    quote: Vec<u8>,
+    collateral: Vec<u8>,
+) -> StdResult<EnvSecretResponse> {
+    // verify attestation
+    let tdx = parse_tdx_attestation(&quote, &collateral)
+        .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
+    // load service
+    let svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
+    // ensure filter match
+    let mut found = false;
+    for entry in svc.filters.iter() {
+        let f = &entry.filter;
+        if let Some(ref p) = f.mr_seam         { if p != &tdx.mr_seam.to_vec()       { continue; } }
+        if let Some(ref p) = f.mr_signer_seam  { if p != &tdx.mr_signer_seam.to_vec() { continue; } }
+        if let Some(ref p) = f.mr_td           { if p != &tdx.mr_td.to_vec()         { continue; } }
+        if let Some(ref p) = f.mr_config_id    { if p != &tdx.mr_config_id.to_vec()  { continue; } }
+        if let Some(ref p) = f.mr_owner        { if p != &tdx.mr_owner.to_vec()      { continue; } }
+        if let Some(ref p) = f.mr_config       { if p != &tdx.mr_config.to_vec()     { continue; } }
+        if let Some(ref p) = f.rtmr0           { if p != &tdx.rtmr0.to_vec()         { continue; } }
+        if let Some(ref p) = f.rtmr1           { if p != &tdx.rtmr1.to_vec()         { continue; } }
+        if let Some(ref p) = f.rtmr2           { if p != &tdx.rtmr2.to_vec()         { continue; } }
+        if let Some(ref p) = f.rtmr3           { if p != &tdx.rtmr3.to_vec()         { continue; } }
+        found = true;
+        break;
+    }
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
+    }
+    // ensure secret exists
+    let plaintext = svc.secrets_plaintext
+        .clone()
+        .ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
+    // encrypt
+    let other_pub: [u8;32] = tdx.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    let height_bytes = env.block.height.to_string().into_bytes();
+    let encrypted = encrypt_secret(plaintext.into_bytes(), other_pub, &quote, height_bytes)?;
+    Ok(EnvSecretResponse {
+        encrypted_secrets_plaintext: encrypted.encrypted_secret_key,
+        encryption_pub_key: encrypted.encryption_pub_key,
+    })
 }
 
 pub fn try_get_docker_credentials_by_image(
@@ -1669,6 +1760,107 @@ mod tests {
         // Should have all fields non-empty
         assert!(!resp.encrypted_username.is_empty());
         assert!(!resp.encrypted_password.is_empty());
+        assert!(!resp.encryption_pub_key.is_empty());
+    }
+
+    #[test]
+    fn add_env_by_service_works() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+        // Create service
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string() }
+        ).unwrap();
+        // Add env secret
+        let res = execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddEnvByService { service_id: "svc1".to_string(), secrets_plaintext: "secret!".to_string() }
+        ).unwrap();
+        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "add_env_by_service"));
+    }
+
+    #[test]
+    fn get_env_by_service_fails_without_secret() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string() }
+        ).unwrap();
+
+
+        // IMPORTANT: add at least one image filter so filter matching passes
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddImageToService {
+                service_id: "svc1".to_string(),
+                image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
+                description: "".to_string(),
+            }
+        ).unwrap();
+
+        // Build dummy quote
+        let quote_len = std::mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len]; quote[0]=4; quote[4]=129;
+        let collateral = vec![0u8;10];
+        let err = try_get_env_by_service(
+            deps.as_ref(), mock_env(), "svc1".to_string(), quote, collateral
+        );
+        match err {
+            Err(StdError::GenericErr { msg, .. }) => assert_eq!(msg, "Env secret for this service not set"),
+            _ => panic!("Expected GenericErr"),
+        }
+    }
+
+    #[test]
+    fn add_and_get_env_by_service_success() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+        // Create and add filter
+        execute(
+            deps.as_mut(), mock_env(), admin.clone(),
+            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string() }
+        ).unwrap();
+        // reuse existing AddImageToService test setup to ensure a matching filter exists
+        // ... (add a filter requiring no specific fields to match)
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddImageToService {
+                service_id: "svc1".to_string(),
+                image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
+                description: "".to_string(),
+            }
+        ).unwrap();
+        // Add service env secret
+        execute(
+            deps.as_mut(), mock_env(), admin.clone(),
+            ExecuteMsg::AddEnvByService { service_id: "svc1".to_string(), secrets_plaintext: "supersecret".to_string() }
+        ).unwrap();
+        // Query it via attestation
+        let quote_len = std::mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len]; quote[0]=4; quote[4]=129;
+        let collateral = vec![0u8;10];
+        let bin = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByService { service_id: "svc1".to_string(), quote, collateral }
+        ).unwrap();
+        let resp: EnvSecretResponse = from_binary(&bin).unwrap();
+        assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
     }
 }

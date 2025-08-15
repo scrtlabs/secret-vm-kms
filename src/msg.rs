@@ -42,6 +42,8 @@ pub enum ExecuteMsg {
         username: String,
         password_plaintext: String,
     },
+    /// NEW: add or update env secret for a service
+    AddEnvByService { service_id: String, secrets_plaintext: String },
 }
 
 /// Query messages for the contract.
@@ -64,6 +66,8 @@ pub enum QueryMsg {
     },
     /// Return filters (with descriptions) for a service
     ListImageFilters { service_id: String },
+    /// NEW: retrieve encrypted env secret for a service
+    GetEnvByService { service_id: String, quote: Vec<u8>, collateral: Vec<u8> },
 }
 
 /// Migrate message enum for contract migration.

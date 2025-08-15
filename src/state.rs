@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use secret_toolkit::storage::Keymap;
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
-const OLD_SERVICES_KEY: &[u8] = b"services";  // old singleton<Vec<OldService>>
-pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(b"services_map");
+const OLD_SERVICES_KEY: &[u8] = b"services_map";  // old singleton<Vec<OldService>>
+const NEW_SERVICES_KEY: &[u8] = b"services_map_new";
+pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(NEW_SERVICES_KEY);
+pub static OLD_SERVICES_MAP: Keymap<String, OldService> = Keymap::new(OLD_SERVICES_KEY);
 
 pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
 pub static DOCKER_CREDENTIALS_KEY: &[u8] = b"docker_credentials";
@@ -71,11 +73,11 @@ pub struct ImageFilter {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct OldService {
-    pub id: u64,
+    pub id: String,
     pub name: String,
-    pub admin: cosmwasm_std::Addr,
+    pub admin: Addr,
+    pub filters: Vec<FilterEntry>,
     pub secret_key: Vec<u8>,
-    pub image_filters: Vec<ImageFilter>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -91,6 +93,9 @@ pub struct Service {
     pub admin: Addr,
     pub filters: Vec<FilterEntry>,
     pub secret_key: Vec<u8>,
+    /// NEW: optional plaintext env secret for the service
+    #[serde(default)]
+    pub secrets_plaintext: Option<String>,
 }
 
 /// Returns a mutable singleton for the global state.
