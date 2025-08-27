@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use secret_toolkit::storage::Keymap;
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
-const OLD_SERVICES_KEY: &[u8] = b"services_map";  // old singleton<Vec<OldService>>
-const NEW_SERVICES_KEY: &[u8] = b"services_map_new";
+const OLD_SERVICES_KEY: &[u8] = b"services_map_new";  // old singleton<Vec<OldService>>
+const NEW_SERVICES_KEY: &[u8] = b"services_map_new_timestamp";
 pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(NEW_SERVICES_KEY);
 pub static OLD_SERVICES_MAP: Keymap<String, OldService> = Keymap::new(OLD_SERVICES_KEY);
 
@@ -76,12 +76,23 @@ pub struct OldService {
     pub id: String,
     pub name: String,
     pub admin: Addr,
-    pub filters: Vec<FilterEntry>,
+    pub filters: Vec<OldFilterEntry>,
     pub secret_key: Vec<u8>,
+    /// NEW: optional plaintext env secret for the service
+    #[serde(default)]
+    pub secrets_plaintext: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct FilterEntry {
+    pub filter: ImageFilter,
+    pub description: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct OldFilterEntry {
     pub filter: ImageFilter,
     pub description: String,
 }

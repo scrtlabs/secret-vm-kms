@@ -30,7 +30,7 @@ pub enum ExecuteMsg {
     /// Create a new service (string ID + name)
     CreateService { service_id: String, name: String },
     /// Add an image filter to a service, with description
-    AddImageToService { service_id: String, image_filter: MsgImageFilter, description: String },
+    AddImageToService { service_id: String, image_filter: MsgImageFilter, description: String , timestamp: Option<u64>,},
     /// Remove an image filter matching the provided definition
     RemoveImageFromService { service_id: String, image_filter: MsgImageFilter },
     /// AddSecretKeyByImage adds a secret key for a given image.
@@ -90,6 +90,7 @@ pub struct ServiceResponse {
 pub struct ImageFilterHexEntry {
     pub filter: ImageFilterHex,
     pub description: String,
+    pub timestamp: Option<u64>,
 }
 
 /// Single filter hex struct

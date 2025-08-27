@@ -8,7 +8,7 @@ use sha2::digest::Update;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
 use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -139,37 +139,79 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // Step 1: Read all old records into memory to avoid borrow conflicts
-            let mut buffer: Vec<(String, OldService)> = Vec::new();
-            for item in OLD_SERVICES_MAP.iter(deps.storage)? {
-                let (k, old) = item?;
-                buffer.push((k, old));
+            // Phase 1: load all old entries into memory to avoid borrow conflicts
+            let mut old_buf: Vec<(String, OldService)> = Vec::new();
+            for it in OLD_SERVICES_MAP.iter(deps.storage)? {
+                let (k, v) = it?;
+                old_buf.push((k, v));
             }
 
-            // Step 2: Insert into the new map and remove from the old map
-            let mut moved = 0u64;
-            for (k, old) in buffer.into_iter() {
-                let new = Service {
+            let mut moved: u64 = 0;
+            let mut merged: u64 = 0;
+            let mut skipped: u64 = 0;
+
+            // Phase 2: move/merge into new map and remove from old map
+            for (key, old) in old_buf.into_iter() {
+                // Convert Vec<OldFilterEntry> -> Vec<FilterEntry> (timestamp = None)
+                let old_to_new_filters = |ofs: &Vec<OldFilterEntry>| -> Vec<FilterEntry> {
+                    ofs.iter().map(|e| FilterEntry {
+                        filter: e.filter.clone(),
+                        description: e.description.clone(),
+                        timestamp: None, // legacy entries have no timestamp
+                    }).collect()
+                };
+
+                let converted_filters = old_to_new_filters(&old.filters);
+
+                // If there is already a new-format Service with the same key, merge filters.
+                if let Some(mut existing) = SERVICES_MAP.get(deps.storage, &key) {
+                    // Merge strategy:
+                    // - Keep existing fields from `existing`
+                    // - Prefer existing.secrets_plaintext if present; otherwise take old.secrets_plaintext
+                    // - Append converted filters that are not already present (match by {filter, description}, ignore timestamp)
+                    let mut appended = 0usize;
+
+                    for nf in converted_filters.into_iter() {
+                        let dup = existing.filters.iter().any(|ef| {
+                            ef.description == nf.description && ef.filter == nf.filter
+                        });
+                        if !dup {
+                            existing.filters.push(nf);
+                            appended += 1;
+                        }
+                    }
+
+                    if existing.secrets_plaintext.is_none() && old.secrets_plaintext.is_some() {
+                        existing.secrets_plaintext = old.secrets_plaintext.clone();
+                    }
+
+                    SERVICES_MAP.insert(deps.storage, &key, &existing)?;
+                    OLD_SERVICES_MAP.remove(deps.storage, &key)?;
+                    merged += 1;
+                    if appended == 0 { skipped += 1; }
+                    continue;
+                }
+
+                // No existing new-format entry → create a new one directly
+                let new_svc = Service {
                     id: old.id.clone(),
                     name: old.name.clone(),
                     admin: old.admin.clone(),
-                    filters: old.filters.clone(),
+                    filters: converted_filters,
                     secret_key: old.secret_key.clone(),
-                    secrets_plaintext: None, // new field remains empty after migration
+                    secrets_plaintext: old.secrets_plaintext.clone(),
                 };
 
-                // Insert the converted service into the new map
-                SERVICES_MAP.insert(deps.storage, &k, &new)?;
-
-                // Remove the old entry to clean up storage
-                OLD_SERVICES_MAP.remove(deps.storage, &k)?;
-
+                SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
+                OLD_SERVICES_MAP.remove(deps.storage, &key)?;
                 moved += 1;
             }
 
             Ok(Response::new()
-                .add_attribute("action", "migrate_services_old_to_new")
-                .add_attribute("moved", moved.to_string()))
+                .add_attribute("action", "migrate_services_map_new_to_new_timestamp")
+                .add_attribute("moved", moved.to_string())
+                .add_attribute("merged", merged.to_string())
+                .add_attribute("skipped", skipped.to_string()))
         }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -207,8 +249,8 @@ pub fn execute(
     match msg {
         ExecuteMsg::CreateService { service_id, name } =>
             try_create_service(deps,env, info, service_id, name),
-        ExecuteMsg::AddImageToService { service_id, image_filter, description } =>
-            try_add_filter(deps, info, service_id, image_filter, description),
+        ExecuteMsg::AddImageToService { service_id, image_filter, description, timestamp } =>
+            try_add_filter(deps, env, info, service_id, image_filter, description, timestamp),
         ExecuteMsg::RemoveImageFromService { service_id, image_filter } =>
             try_remove_filter(deps, info, service_id, image_filter),
         ExecuteMsg::AddSecretKeyByImage { image_filter } => {
@@ -484,10 +526,12 @@ fn try_create_service(
 /// Add filter
 fn try_add_filter(
     deps: DepsMut,
+    env: Env,
     info: MessageInfo,
     service_id: String,
     image_filter: MsgImageFilter,
     description: String,
+    timestamp: Option<u64>,
 ) -> StdResult<Response> {
     // Fetch service or error
     let mut svc = SERVICES_MAP
@@ -510,8 +554,15 @@ fn try_add_filter(
         rtmr2: image_filter.rtmr2.clone(),
         rtmr3: image_filter.rtmr3.clone(),
     };
+
+    // Decide the timestamp to store:
+    // - if provided in the message, use it
+    // - otherwise, use current block time (seconds)
+    // (legacy entries will remain `None` after migration)
+    let ts_to_store = timestamp.or(Some(env.block.time.seconds()));
+
     // Add new filter entry
-    svc.filters.push(FilterEntry { filter: entry_filter.clone(), description: description.clone() });
+    svc.filters.push(FilterEntry { filter: entry_filter.clone(), description: description.clone() ,timestamp: ts_to_store,  });
     // Persist updated service
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
     // Prepare a JSON string of the filter for the event
@@ -533,6 +584,13 @@ fn try_add_filter(
 
     if !description.is_empty() {
         resp = resp.add_attribute("description", description.clone());
+    }
+
+    if let Some(ts) = ts_to_store {
+        ev = ev.add_attribute_plaintext("timestamp", ts.to_string());
+    }
+    if let Some(ts) = ts_to_store {
+        resp = resp.add_attribute("timestamp", ts.to_string());
     }
 
     Ok(resp.add_event(ev))
@@ -899,6 +957,7 @@ fn query_image_filters(deps: Deps, service_id: String) -> StdResult<ListImageRes
     let svc = SERVICES_MAP
         .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
+
     let list = svc.filters.iter().map(|entry| {
         let f = &entry.filter;
         ImageFilterHexEntry {
@@ -915,8 +974,10 @@ fn query_image_filters(deps: Deps, service_id: String) -> StdResult<ListImageRes
                 rtmr3: f.rtmr3.as_ref().map(|b| hex::encode(b)),
             },
             description: entry.description.clone(),
+            timestamp: entry.timestamp,
         }
     }).collect();
+
     Ok(ListImageResponse { filters: list })
 }
 
@@ -1081,7 +1142,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter: image_filter.clone(), description: "TestImage".to_string() };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter: image_filter.clone(), description: "TestImage".to_string(), timestamp: None};
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
         assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_image_to_service"));
         let remove_msg = ExecuteMsg::RemoveImageFromService { service_id: "0".to_string(), image_filter };
@@ -1113,7 +1174,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter, description: "TestImage".to_string() };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter, description: "TestImage".to_string(), timestamp: None };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
         // Construct a dummy quote buffer of size_of::<tdx_quote_t>()
         let quote_len = mem::size_of::<tdx_quote_t>();
@@ -1183,7 +1244,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter, timestamp: None };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
 
         // Query the secret key using the quote and collateral read from file.
@@ -1223,7 +1284,7 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter };
+        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter, timestamp: None };
         let res = execute(deps.as_mut(), mock_env(), other_info.clone(), add_msg);
         match res {
             Err(StdError::GenericErr { msg, .. }) => {
@@ -1273,6 +1334,7 @@ mod tests {
                 service_id: svc_id.clone(),
                 image_filter: msg_filter.clone(),
                 description: desc.clone(),
+                timestamp: None,
             },
         ).unwrap();
 
@@ -1807,6 +1869,7 @@ mod tests {
                 service_id: "svc1".to_string(),
                 image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
                 description: "".to_string(),
+                timestamp: None,
             }
         ).unwrap();
 
@@ -1843,6 +1906,7 @@ mod tests {
                 service_id: "svc1".to_string(),
                 image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
                 description: "".to_string(),
+                timestamp: None,
             }
         ).unwrap();
         // Add service env secret
@@ -1862,5 +1926,139 @@ mod tests {
         let resp: EnvSecretResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
+    }
+    #[test]
+    fn add_image_with_explicit_timestamp_is_stored() {
+        use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateService { service_id: "svc".into(), name: "N".into() }
+        ).unwrap();
+
+        let image_filter = MsgImageFilter {
+            mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![1;48]),
+            mr_config_id: None, mr_owner: None, mr_config: None,
+            rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None,
+        };
+
+        let explicit_ts = 1_725_000_000u64;
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddImageToService {
+                service_id: "svc".into(),
+                image_filter: image_filter.clone(),
+                description: "d".into(),
+                timestamp: Some(explicit_ts),   // <-- explicit
+            }
+        ).unwrap();
+
+        // Read back from storage and assert timestamp
+        let svc = SERVICES_MAP.get(&deps.storage, &"svc".to_string()).unwrap();
+        assert_eq!(svc.filters.len(), 1);
+        assert_eq!(svc.filters[0].timestamp, Some(explicit_ts));
+    }
+    #[test]
+    fn add_image_without_timestamp_uses_block_time() {
+        use cosmwasm_std::{testing::{mock_dependencies, mock_info}, Timestamp};
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateService { service_id: "svc".into(), name: "N".into() }
+        ).unwrap();
+
+        let image_filter = MsgImageFilter {
+            mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![2;48]),
+            mr_config_id: None, mr_owner: None, mr_config: None,
+            rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None,
+        };
+
+        // Prepare env with a known timestamp
+        let mut env = mock_env();
+        env.block.time = Timestamp::from_seconds(42);
+
+        execute(
+            deps.as_mut(),
+            env.clone(),
+            admin.clone(),
+            ExecuteMsg::AddImageToService {
+                service_id: "svc".into(),
+                image_filter: image_filter.clone(),
+                description: "d2".into(),
+                timestamp: None,               // <-- omitted -> use env.block.time
+            }
+        ).unwrap();
+
+        let svc = SERVICES_MAP.get(&deps.storage, &"svc".to_string()).unwrap();
+        assert_eq!(svc.filters.len(), 1);
+        assert_eq!(svc.filters[0].timestamp, Some(42));
+    }
+
+    #[test]
+    fn migrate_moves_old_services_into_new_map() {
+        use cosmwasm_std::testing::{mock_dependencies, mock_env};
+        use cosmwasm_std::{Addr};
+        use crate::state::*;
+        use crate::contract::migrate;
+        use crate::msg::MigrateMsg;
+
+        let mut deps = mock_dependencies();
+
+        // Seed OLD_SERVICES_MAP with one legacy service (no timestamps in filters)
+        let key = "svc-old-1".to_string();
+        let old = OldService {
+            id: "svc-old-1".into(),
+            name: "Legacy".into(),
+            admin: Addr::unchecked("admin"),
+            filters: vec![
+                OldFilterEntry {
+                    filter: ImageFilter {
+                        mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![1;48]),
+                        mr_config_id: None, mr_owner: None, mr_config: None,
+                        rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
+                    },
+                    description: "legacy-filter".into(),
+                }
+            ],
+            secret_key: vec![9; 32],
+            secrets_plaintext: Some("legacy-secret".into()),
+        };
+        OLD_SERVICES_MAP.insert(deps.as_mut().storage, &key, &old).unwrap();
+
+        // Run migrate
+        let resp = migrate(deps.as_mut(), mock_env(), MigrateMsg::Migrate {}).unwrap();
+
+        // Check action attrs
+        assert!(resp.attributes.iter().any(|a| a.key=="action" && a.value=="migrate_services_map_new_to_new_timestamp"));
+        // moved == 1, merged == 0 or skipped arbitrary (here 0)
+        let moved = resp.attributes.iter().find(|a| a.key=="moved").unwrap().value.parse::<u64>().unwrap();
+        let merged = resp.attributes.iter().find(|a| a.key=="merged").unwrap().value.parse::<u64>().unwrap();
+        assert_eq!(moved, 1);
+        assert_eq!(merged, 0);
+
+        // Old removed
+        assert!(OLD_SERVICES_MAP.get(&deps.storage, &key).is_none());
+
+        // New exists with timestamp == None on filters
+        let new = SERVICES_MAP.get(&deps.storage, &key).expect("new service must exist");
+        assert_eq!(new.id, "svc-old-1");
+        assert_eq!(new.name, "Legacy");
+        assert_eq!(new.filters.len(), 1);
+        assert_eq!(new.filters[0].description, "legacy-filter");
+        assert_eq!(new.filters[0].timestamp, None);
+        assert_eq!(new.secrets_plaintext.as_deref(), Some("legacy-secret"));
+        assert_eq!(new.secret_key, vec![9;32]);
     }
 }
