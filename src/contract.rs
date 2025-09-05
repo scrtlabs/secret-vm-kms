@@ -138,80 +138,80 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 #[entry_point]
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
-        MigrateMsg::Migrate {} => {
-            // Phase 1: load all old entries into memory to avoid borrow conflicts
-            let mut old_buf: Vec<(String, OldService)> = Vec::new();
-            for it in OLD_SERVICES_MAP.iter(deps.storage)? {
-                let (k, v) = it?;
-                old_buf.push((k, v));
-            }
-
-            let mut moved: u64 = 0;
-            let mut merged: u64 = 0;
-            let mut skipped: u64 = 0;
-
-            // Phase 2: move/merge into new map and remove from old map
-            for (key, old) in old_buf.into_iter() {
-                // Convert Vec<OldFilterEntry> -> Vec<FilterEntry> (timestamp = None)
-                let old_to_new_filters = |ofs: &Vec<OldFilterEntry>| -> Vec<FilterEntry> {
-                    ofs.iter().map(|e| FilterEntry {
-                        filter: e.filter.clone(),
-                        description: e.description.clone(),
-                        timestamp: None, // legacy entries have no timestamp
-                    }).collect()
-                };
-
-                let converted_filters = old_to_new_filters(&old.filters);
-
-                // If there is already a new-format Service with the same key, merge filters.
-                if let Some(mut existing) = SERVICES_MAP.get(deps.storage, &key) {
-                    // Merge strategy:
-                    // - Keep existing fields from `existing`
-                    // - Prefer existing.secrets_plaintext if present; otherwise take old.secrets_plaintext
-                    // - Append converted filters that are not already present (match by {filter, description}, ignore timestamp)
-                    let mut appended = 0usize;
-
-                    for nf in converted_filters.into_iter() {
-                        let dup = existing.filters.iter().any(|ef| {
-                            ef.description == nf.description && ef.filter == nf.filter
-                        });
-                        if !dup {
-                            existing.filters.push(nf);
-                            appended += 1;
-                        }
-                    }
-
-                    if existing.secrets_plaintext.is_none() && old.secrets_plaintext.is_some() {
-                        existing.secrets_plaintext = old.secrets_plaintext.clone();
-                    }
-
-                    SERVICES_MAP.insert(deps.storage, &key, &existing)?;
-                    OLD_SERVICES_MAP.remove(deps.storage, &key)?;
-                    merged += 1;
-                    if appended == 0 { skipped += 1; }
-                    continue;
-                }
-
-                // No existing new-format entry → create a new one directly
-                let new_svc = Service {
-                    id: old.id.clone(),
-                    name: old.name.clone(),
-                    admin: old.admin.clone(),
-                    filters: converted_filters,
-                    secret_key: old.secret_key.clone(),
-                    secrets_plaintext: old.secrets_plaintext.clone(),
-                };
-
-                SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
-                OLD_SERVICES_MAP.remove(deps.storage, &key)?;
-                moved += 1;
-            }
+         MigrateMsg::Migrate {} => {
+        //     // Phase 1: load all old entries into memory to avoid borrow conflicts
+        //     let mut old_buf: Vec<(String, OldService)> = Vec::new();
+        //     for it in OLD_SERVICES_MAP.iter(deps.storage)? {
+        //         let (k, v) = it?;
+        //         old_buf.push((k, v));
+        //     }
+        //
+        //     let mut moved: u64 = 0;
+        //     let mut merged: u64 = 0;
+        //     let mut skipped: u64 = 0;
+        //
+        //     // Phase 2: move/merge into new map and remove from old map
+        //     for (key, old) in old_buf.into_iter() {
+        //         // Convert Vec<OldFilterEntry> -> Vec<FilterEntry> (timestamp = None)
+        //         let old_to_new_filters = |ofs: &Vec<OldFilterEntry>| -> Vec<FilterEntry> {
+        //             ofs.iter().map(|e| FilterEntry {
+        //                 filter: e.filter.clone(),
+        //                 description: e.description.clone(),
+        //                 timestamp: None, // legacy entries have no timestamp
+        //             }).collect()
+        //         };
+        //
+        //         let converted_filters = old_to_new_filters(&old.filters);
+        //
+        //         // If there is already a new-format Service with the same key, merge filters.
+        //         if let Some(mut existing) = SERVICES_MAP.get(deps.storage, &key) {
+        //             // Merge strategy:
+        //             // - Keep existing fields from `existing`
+        //             // - Prefer existing.secrets_plaintext if present; otherwise take old.secrets_plaintext
+        //             // - Append converted filters that are not already present (match by {filter, description}, ignore timestamp)
+        //             let mut appended = 0usize;
+        //
+        //             for nf in converted_filters.into_iter() {
+        //                 let dup = existing.filters.iter().any(|ef| {
+        //                     ef.description == nf.description && ef.filter == nf.filter
+        //                 });
+        //                 if !dup {
+        //                     existing.filters.push(nf);
+        //                     appended += 1;
+        //                 }
+        //             }
+        //
+        //             if existing.secrets_plaintext.is_none() && old.secrets_plaintext.is_some() {
+        //                 existing.secrets_plaintext = old.secrets_plaintext.clone();
+        //             }
+        //
+        //             SERVICES_MAP.insert(deps.storage, &key, &existing)?;
+        //             OLD_SERVICES_MAP.remove(deps.storage, &key)?;
+        //             merged += 1;
+        //             if appended == 0 { skipped += 1; }
+        //             continue;
+        //         }
+        //
+        //         // No existing new-format entry → create a new one directly
+        //         let new_svc = Service {
+        //             id: old.id.clone(),
+        //             name: old.name.clone(),
+        //             admin: old.admin.clone(),
+        //             filters: converted_filters,
+        //             secret_key: old.secret_key.clone(),
+        //             secrets_plaintext: old.secrets_plaintext.clone(),
+        //         };
+        //
+        //         SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
+        //         OLD_SERVICES_MAP.remove(deps.storage, &key)?;
+        //         moved += 1;
+        //     }
 
             Ok(Response::new()
-                .add_attribute("action", "migrate_services_map_new_to_new_timestamp")
-                .add_attribute("moved", moved.to_string())
-                .add_attribute("merged", merged.to_string())
-                .add_attribute("skipped", skipped.to_string()))
+                .add_attribute("action", "migrate"))
+                // .add_attribute("moved", moved.to_string())
+                // .add_attribute("merged", merged.to_string())
+                // .add_attribute("skipped", skipped.to_string()))
         }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -978,7 +978,7 @@ fn query_image_filters(deps: Deps, service_id: String) -> StdResult<ListImageRes
         }
     }).collect();
 
-    Ok(ListImageResponse { filters: list })
+    Ok(ListImageResponse {service_id,  filters: list })
 }
 
 /// NEW: Retrieve the environment secret using an attestation.

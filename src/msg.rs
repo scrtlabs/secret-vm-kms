@@ -111,6 +111,7 @@ pub struct ImageFilterHex {
 /// Response wrapper for listing filters
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct ListImageResponse {
+    pub service_id: String,
     pub filters: Vec<ImageFilterHexEntry>,
 }
 
