@@ -5,10 +5,20 @@ use serde::{Deserialize, Serialize};
 use secret_toolkit::storage::Keymap;
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
-const OLD_SERVICES_KEY: &[u8] = b"services_map_new";  // old singleton<Vec<OldService>>
-const NEW_SERVICES_KEY: &[u8] = b"services_map_new_timestamp";
-pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(NEW_SERVICES_KEY);
+// ---------- Services maps ----------
+// IMPORTANT: The *old* map is NOW the map stored under "services_map_new_timestamp".
+const OLD_SERVICES_KEY: &[u8] = b"services_map_new_timestamp";
+
+// The *new current* services map (adds optional password_hash). Keep the public name the same.
+const NEW_SERVICES_KEY: &[u8] = b"services_map_with_password";
+
+// Keep names the same to avoid wide renames:
 pub static OLD_SERVICES_MAP: Keymap<String, OldService> = Keymap::new(OLD_SERVICES_KEY);
+pub static SERVICES_MAP:     Keymap<String, Service>    = Keymap::new(NEW_SERVICES_KEY);
+
+// ---------- VM unified records (NEW Keymap), but name kept simple ----------
+const VM_RECORDS_KEY: &[u8] = b"vm_records_map";
+pub static VM_RECORDS: Keymap<Vec<u8>, VmRecord> = Keymap::new(VM_RECORDS_KEY);
 
 pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
 pub static DOCKER_CREDENTIALS_KEY: &[u8] = b"docker_credentials";
@@ -71,14 +81,14 @@ pub struct ImageFilter {
     pub rtmr3: Option<Vec<u8>>,
 }
 
+// Old service (previous current; no password_hash)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct OldService {
     pub id: String,
     pub name: String,
     pub admin: Addr,
-    pub filters: Vec<OldFilterEntry>,
+    pub filters: Vec<FilterEntry>,
     pub secret_key: Vec<u8>,
-    /// NEW: optional plaintext env secret for the service
     #[serde(default)]
     pub secrets_plaintext: Option<String>,
 }
@@ -97,6 +107,7 @@ pub struct OldFilterEntry {
     pub description: String,
 }
 
+// New service (adds optional password_hash). Public name preserved: Service
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Service {
     pub id: String,
@@ -104,9 +115,9 @@ pub struct Service {
     pub admin: Addr,
     pub filters: Vec<FilterEntry>,
     pub secret_key: Vec<u8>,
-    /// NEW: optional plaintext env secret for the service
-    #[serde(default)]
     pub secrets_plaintext: Option<String>,
+    /// Optional hex(SHA256(password))
+    pub password_hash: Option<String>,
 }
 
 /// Returns a mutable singleton for the global state.
@@ -149,4 +160,17 @@ pub struct DockerCredential {
     pub vm_uid: Option<Vec<u8>>,
     pub docker_username: String,
     pub docker_password_plaintext: String,
+}
+
+// New unified VM record (Keymap by vm_uid)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct VmRecord {
+    /// Full image filter snapshot to be checked against attestation
+    pub filter: ImageFilter,
+    /// Hex-encoded secret key, if present
+    pub secret_key_hex: Option<String>,
+    /// Plain env, if present
+    pub env_plaintext: Option<String>,
+    /// Optional hex(SHA256(password))
+    pub password_hash: Option<String>,
 }
