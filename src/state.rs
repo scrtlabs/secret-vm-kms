@@ -23,6 +23,12 @@ pub static VM_RECORDS: Keymap<Vec<u8>, VmRecord> = Keymap::new(VM_RECORDS_KEY);
 pub static ENV_SECRETS_KEY: &[u8] = b"env_secrets";
 pub static DOCKER_CREDENTIALS_KEY: &[u8] = b"docker_credentials";
 
+// NEW: primary VM-keyed map for docker credentials.
+pub const DOCKER_CREDENTIALS_MAP_KEY: &[u8] = b"docker_credentials_by_vm";
+
+/// Primary storage: map keyed by vm_uid (Vec<u8>)
+pub static DOCKER_CREDENTIALS: Keymap<Vec<u8>, DockerCredential> =
+    Keymap::new(DOCKER_CREDENTIALS_MAP_KEY);
 
 // NEW: import bucket helpers
 use cosmwasm_storage::{bucket, bucket_read, Bucket, ReadonlyBucket};

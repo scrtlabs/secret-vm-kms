@@ -8,7 +8,7 @@ use std::backtrace::Backtrace;
 use thiserror::Error;
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
 use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -280,19 +280,18 @@ pub fn try_add_docker_credentials_by_image(
     username: String,
     password_plaintext: String,
 ) -> StdResult<Response> {
-    // Ensure the sender is the global admin.
+    // Only global admin can add docker credentials
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
-        return Err(StdError::generic_err(
-            "Only the admin can add docker credentials",
-        ));
+        return Err(StdError::generic_err("Only the admin can add docker credentials"));
     }
 
-    // Extract the VM uid (required)
-    let vm_uid = image_filter.vm_uid
+    // vm_uid is REQUIRED (we store by vm_uid)
+    let vm_uid = image_filter
+        .vm_uid
         .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
-    // Check that the required fields are provided.
+    // Pin to exact image values
     if image_filter.mr_td.is_none()
         || image_filter.rtmr1.is_none()
         || image_filter.rtmr2.is_none()
@@ -303,47 +302,37 @@ pub fn try_add_docker_credentials_by_image(
         ));
     }
 
-    // Create a new DockerCredential structure from the provided image filter.
-    let new_docker_credential = DockerCredential {
+    let new_rec = DockerCredential {
         mr_td: image_filter.mr_td.clone().unwrap(),
         rtmr1: image_filter.rtmr1.clone().unwrap(),
         rtmr2: image_filter.rtmr2.clone().unwrap(),
         rtmr3: image_filter.rtmr3.clone().unwrap(),
-        vm_uid: Some(vm_uid),
+        vm_uid: Some(vm_uid.clone()),
         docker_username: username.clone(),
         docker_password_plaintext: password_plaintext.clone(),
     };
 
-    let mut docker_credentials_list: Vec<DockerCredential> =
-        docker_credentials(deps.storage).load().unwrap_or_else(|_| Vec::new());
-
+    // Write/update in the VM-keyed map
     let mut updated = false;
-    for cred in docker_credentials_list.iter_mut() {
-        if cred.mr_td == new_docker_credential.mr_td
-            && cred.rtmr1 == new_docker_credential.rtmr1
-            && cred.rtmr2 == new_docker_credential.rtmr2
-            && cred.rtmr3 == new_docker_credential.rtmr3
-            && cred.vm_uid == new_docker_credential.vm_uid
-        {
-            // Update the credentials.
-            cred.docker_username = username.clone();
-            cred.docker_password_plaintext = password_plaintext.clone();
-            updated = true;
-            break;
-        }
+    if let Some(mut existing) = DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
+        // Overwrite to keep latest filter+creds
+        existing.mr_td = new_rec.mr_td.clone();
+        existing.rtmr1 = new_rec.rtmr1.clone();
+        existing.rtmr2 = new_rec.rtmr2.clone();
+        existing.rtmr3 = new_rec.rtmr3.clone();
+        existing.docker_username = new_rec.docker_username.clone();
+        existing.docker_password_plaintext = new_rec.docker_password_plaintext.clone();
+        DOCKER_CREDENTIALS.insert(deps.storage, &vm_uid, &existing)?;
+        updated = true;
+    } else {
+        DOCKER_CREDENTIALS.insert(deps.storage, &vm_uid, &new_rec)?;
     }
 
-    if !updated {
-        docker_credentials_list.push(new_docker_credential);
-    }
-
-    docker_credentials(deps.storage).save(&docker_credentials_list)?;
-
+    // We do NOT write to the legacy vector; query has a legacy reverse-scan fallback.
     Ok(Response::new()
         .add_attribute("action", "add_docker_credentials_by_image")
         .add_attribute("updated", updated.to_string()))
 }
-
 
 /// NEW: Add or update an environment secret by image.
 /// This function expects that the provided image filter includes non‑None values for
@@ -821,44 +810,65 @@ pub fn try_get_docker_credentials_by_image(
     quote: Vec<u8>,
     collateral: Vec<u8>,
 ) -> StdResult<DockerCredentialsResponse> {
-    // Verify + parse
     let tdx = parse_tdx_attestation(&quote, &collateral)
         .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
 
-    // Extract mr_td, rtmr1, rtmr2, rtmr3
+    // Fields from quote
     let mr_td = tdx.mr_td.to_vec();
-    let r1    = tdx.rtmr1.to_vec();
-    let r2    = tdx.rtmr2.to_vec();
-    let r3    = tdx.rtmr3.to_vec();
+    let r1 = tdx.rtmr1.to_vec();
+    let r2 = tdx.rtmr2.to_vec();
+    let r3 = tdx.rtmr3.to_vec();
+    let vm_uid = tdx.report_data[32..48].to_vec(); // 16 bytes after pubkey
 
-    // Extract VM UID from report_data: next 16 bytes after the 32-byte pubkey, hex-encoded
-    let vm_uid = tdx.report_data[32..48].to_vec();
+    // 1) Primary lookup: VM-keyed map
+    if let Some(rec) = DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
+        // Enforce exact match between stored image params and attestation
+        if rec.mr_td != mr_td || rec.rtmr1 != r1 || rec.rtmr2 != r2 || rec.rtmr3 != r3 {
+            return Err(StdError::generic_err(
+                "Filter mismatch for docker credentials VM record",
+            ));
+        }
+        let other_pub: [u8; 32] = tdx.report_data[0..32]
+            .try_into()
+            .map_err(|_| StdError::generic_err("Bad report_data"))?;
+        let height_bytes = env.block.height.to_string().into_bytes();
+        return encrypt_docker_credentials(
+            rec.docker_username,
+            rec.docker_password_plaintext,
+            other_pub,
+            &quote,
+            height_bytes,
+        );
+    }
 
-    let docker_credentials_list = docker_credentials_read(deps.storage).load()?;
-    let docker_credential = docker_credentials_list
-        .into_iter()
-        .find(|cred| {
-            cred.mr_td == mr_td
-                && cred.rtmr1 == r1
-                && cred.rtmr2 == r2
-                && cred.rtmr3 == r3
-                && cred.vm_uid.as_ref().unwrap() == &vm_uid
-        })
-        .ok_or_else(|| StdError::generic_err("No docker credentials found for this image"))?;
+    // 2) Legacy fallback: scan the old Vec from the END (last-write wins)
+    let legacy_list = docker_credentials_read(deps.storage).load().unwrap_or_default();
+    if let Some(rec) = legacy_list.iter().rev().find(|cred| {
+        cred.mr_td == mr_td
+            && cred.rtmr1 == r1
+            && cred.rtmr2 == r2
+            && cred.rtmr3 == r3
+            && cred.vm_uid
+            .as_ref()
+            .map(|v| v == &vm_uid)
+            .unwrap_or(true) // legacy may have vm_uid=None
+    }) {
+        let other_pub: [u8; 32] = tdx.report_data[0..32]
+            .try_into()
+            .map_err(|_| StdError::generic_err("Bad report_data"))?;
+        let height_bytes = env.block.height.to_string().into_bytes();
+        return encrypt_docker_credentials(
+            rec.docker_username.clone(),
+            rec.docker_password_plaintext.clone(),
+            other_pub,
+            &quote,
+            height_bytes,
+        );
+    }
 
-
-    // Encrypt that plaintext
-    let other_pub: [u8;32] = tdx.report_data[0..32].try_into()
-        .map_err(|_| StdError::generic_err("Bad report_data"))?;
-    let height_bytes = env.block.height.to_string().into_bytes();
-
-    encrypt_docker_credentials(
-        docker_credential.docker_username,
-        docker_credential.docker_password_plaintext,
-        other_pub,
-        &quote,
-        height_bytes,
-    )
+    Err(StdError::generic_err(
+        "No docker credentials found for this image",
+    ))
 }
 
 /// Query image filters, returning hex-encoded image fields
@@ -918,10 +928,21 @@ pub fn try_get_env_by_image(
     // Legacy fallback (scan vector)
     let legacy = env_secrets_read(deps.storage).load().map_err(|_| StdError::generic_err("Legacy env storage missing"))?;
     let mr_td = tdx.mr_td.to_vec(); let r1 = tdx.rtmr1.to_vec(); let r2 = tdx.rtmr2.to_vec(); let r3 = tdx.rtmr3.to_vec();
-    let candidate = legacy.into_iter().find(|e| {
-        e.mr_td == mr_td && e.rtmr1 == r1 && e.rtmr2 == r2 && e.rtmr3 == r3 &&
-            e.vm_uid.as_ref().map(|v| v == &vm_uid).unwrap_or(true)
-    }).ok_or_else(|| StdError::generic_err("No env secret found"))?;
+    let candidate = legacy
+        .iter()
+        .rev()
+        .find(|e| {
+            e.mr_td == mr_td
+                && e.rtmr1 == r1
+                && e.rtmr2 == r2
+                && e.rtmr3 == r3
+                && e.vm_uid
+                .as_ref()
+                .map(|v| v == &vm_uid)
+                .unwrap_or(true) // legacy may have vm_uid = None
+        })
+        .cloned() // we iter() above, so clone the found EnvSecret
+        .ok_or_else(|| StdError::generic_err("No env secret found"))?;
 
     let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
     let enc = encrypt_secret(candidate.secrets_plaintext.into_bytes(), other_pub, &quote, env.block.height.to_string().into_bytes())?;
