@@ -13,6 +13,13 @@ use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
 
+// Fixed legacy MR_TD used to derive the legacy image_key (48 bytes).
+// This is ONLY for the legacy fallback path in `try_get_secret_key_by_image`.
+const LEGACY_FIXED_MR_TD: [u8; 48] = hex_literal::hex!(
+    "ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5a
+     daf02d4aa88433b559fb13bd40f0109e"
+);
+
 /// Declaration of tdx_quote_hdr_t and tdx_quote_t as provided.
 /// DO NOT CHANGE THIS CODE.
 #[repr(C)]
@@ -139,43 +146,43 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // Phase 1: load all old records into memory to avoid borrow issues
-            let mut buf: Vec<(String, OldService)> = Vec::new();
-            for it in OLD_SERVICES_MAP.iter(deps.storage)? {
-                let (k, v) = it?;
-                buf.push((k, v));
-            }
-
-            let mut moved: u64 = 0;
-            let mut replaced: u64 = 0;
-
-            // Phase 2: insert into SERVICES_MAP with password_hash=None
-            for (key, old) in buf.into_iter() {
-                let new_svc = Service {
-                    id: old.id.clone(),
-                    name: old.name.clone(),
-                    admin: old.admin.clone(),
-                    filters: old.filters.clone(),
-                    secret_key: old.secret_key.clone(),
-                    secrets_plaintext: old.secrets_plaintext.clone(),
-                    password_hash: None, // new field default
-                };
-
-                if SERVICES_MAP.contains(deps.storage, &key) {
-                    SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
-                    replaced += 1;
-                } else {
-                    SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
-                    moved += 1;
-                }
-                // remove from OLD map after move
-                OLD_SERVICES_MAP.remove(deps.storage, &key)?;
-            }
+            // // Phase 1: load all old records into memory to avoid borrow issues
+            // let mut buf: Vec<(String, OldService)> = Vec::new();
+            // for it in OLD_SERVICES_MAP.iter(deps.storage)? {
+            //     let (k, v) = it?;
+            //     buf.push((k, v));
+            // }
+            //
+            // let mut moved: u64 = 0;
+            // let mut replaced: u64 = 0;
+            //
+            // // Phase 2: insert into SERVICES_MAP with password_hash=None
+            // for (key, old) in buf.into_iter() {
+            //     let new_svc = Service {
+            //         id: old.id.clone(),
+            //         name: old.name.clone(),
+            //         admin: old.admin.clone(),
+            //         filters: old.filters.clone(),
+            //         secret_key: old.secret_key.clone(),
+            //         secrets_plaintext: old.secrets_plaintext.clone(),
+            //         password_hash: None, // new field default
+            //     };
+            //
+            //     if SERVICES_MAP.contains(deps.storage, &key) {
+            //         SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
+            //         replaced += 1;
+            //     } else {
+            //         SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
+            //         moved += 1;
+            //     }
+            //     // remove from OLD map after move
+            //     OLD_SERVICES_MAP.remove(deps.storage, &key)?;
+            // }
 
             Ok(Response::new()
-                .add_attribute("action", "migrate_services_old_to_new_with_password")
-                .add_attribute("moved", moved.to_string())
-                .add_attribute("replaced", replaced.to_string()))
+                .add_attribute("action", "migrate"))
+                // .add_attribute("moved", moved.to_string())
+                // .add_attribute("replaced", replaced.to_string()))
         }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -707,8 +714,11 @@ pub fn try_get_secret_key_by_image(
     }
 
     // Legacy fallback by image hash (no password for legacy)
+    // NOTE: historically, `mr_td` in the legacy pipeline was always a fixed value.
+    // To preserve compatibility, we DO NOT use `tdx.mr_td` here; we hash with the fixed legacy MR_TD.
     let mut hasher = Sha256::new();
-    hasher.update(&tdx.mr_td);
+    // IMPORTANT: use the fixed legacy MR_TD constant instead of the parsed mr_td
+    hasher.update(&LEGACY_FIXED_MR_TD);
     hasher.update(&tdx.rtmr1);
     hasher.update(&tdx.rtmr2);
     hasher.update(&tdx.rtmr3);
@@ -755,7 +765,6 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t) -> bool {
     let mr_seam = tdx.mr_seam.to_vec();
     let mr_signer = tdx.mr_signer_seam.to_vec();
-    let mr_td = tdx.mr_td.to_vec();
     let mr_config_id = tdx.mr_config_id.to_vec();
     let mr_owner = tdx.mr_owner.to_vec();
     let mr_config = tdx.mr_config.to_vec();
@@ -766,7 +775,7 @@ fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t) -> bool {
 
     if let Some(p) = &f.mr_seam        { if p != &mr_seam   { return false; } }
     if let Some(p) = &f.mr_signer_seam { if p != &mr_signer { return false; } }
-    if let Some(p) = &f.mr_td          { if p != &mr_td     { return false; } }
+    // if let Some(p) = &f.mr_td          { if p != &mr_td     { return false; } }
     if let Some(p) = &f.mr_config_id   { if p != &mr_config_id { return false; } }
     if let Some(p) = &f.mr_owner       { if p != &mr_owner  { return false; } }
     if let Some(p) = &f.mr_config      { if p != &mr_config { return false; } }
@@ -814,7 +823,6 @@ pub fn try_get_docker_credentials_by_image(
         .ok_or_else(|| StdError::generic_err("Attestation invalid"))?;
 
     // Fields from quote
-    let mr_td = tdx.mr_td.to_vec();
     let r1 = tdx.rtmr1.to_vec();
     let r2 = tdx.rtmr2.to_vec();
     let r3 = tdx.rtmr3.to_vec();
@@ -823,7 +831,7 @@ pub fn try_get_docker_credentials_by_image(
     // 1) Primary lookup: VM-keyed map
     if let Some(rec) = DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
         // Enforce exact match between stored image params and attestation
-        if rec.mr_td != mr_td || rec.rtmr1 != r1 || rec.rtmr2 != r2 || rec.rtmr3 != r3 {
+        if rec.rtmr1 != r1 || rec.rtmr2 != r2 || rec.rtmr3 != r3 {
             return Err(StdError::generic_err(
                 "Filter mismatch for docker credentials VM record",
             ));
@@ -844,8 +852,7 @@ pub fn try_get_docker_credentials_by_image(
     // 2) Legacy fallback: scan the old Vec from the END (last-write wins)
     let legacy_list = docker_credentials_read(deps.storage).load().unwrap_or_default();
     if let Some(rec) = legacy_list.iter().rev().find(|cred| {
-        cred.mr_td == mr_td
-            && cred.rtmr1 == r1
+            cred.rtmr1 == r1
             && cred.rtmr2 == r2
             && cred.rtmr3 == r3
             && cred.vm_uid
@@ -927,13 +934,12 @@ pub fn try_get_env_by_image(
 
     // Legacy fallback (scan vector)
     let legacy = env_secrets_read(deps.storage).load().map_err(|_| StdError::generic_err("Legacy env storage missing"))?;
-    let mr_td = tdx.mr_td.to_vec(); let r1 = tdx.rtmr1.to_vec(); let r2 = tdx.rtmr2.to_vec(); let r3 = tdx.rtmr3.to_vec();
+    let r1 = tdx.rtmr1.to_vec(); let r2 = tdx.rtmr2.to_vec(); let r3 = tdx.rtmr3.to_vec();
     let candidate = legacy
         .iter()
         .rev()
         .find(|e| {
-            e.mr_td == mr_td
-                && e.rtmr1 == r1
+                e.rtmr1 == r1
                 && e.rtmr2 == r2
                 && e.rtmr3 == r3
                 && e.vm_uid
