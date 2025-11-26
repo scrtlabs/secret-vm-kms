@@ -428,6 +428,7 @@ fn try_add_secret_key_by_image(
 }
 
 /// Create service: generate secret_key via SHA256(env.random + id)
+/// The sender becomes the service admin
 fn try_create_service(
     deps: DepsMut,
     env: Env,
@@ -436,8 +437,6 @@ fn try_create_service(
     name: String,
     password_hash: Option<String>,
 ) -> StdResult<Response> {
-    let state = global_state_read(deps.storage).load()?;
-    if info.sender.to_string() != state.admin { return Err(StdError::generic_err("Only admin")); }
     // Check for existing service_id
     if SERVICES_MAP.contains(deps.storage, &service_id) {
         return Err(StdError::generic_err("Service ID exists"));
@@ -451,7 +450,8 @@ fn try_create_service(
     sha2::Digest::update(&mut hasher, &random_bytes);
     sha2::Digest::update(&mut hasher, service_id.as_bytes());
     let secret_key = hasher.finalize().to_vec();
-    let svc = Service { id: service_id.clone(), name: name.clone(), admin: state.admin.clone(), secret_key, filters: Vec::new(), secrets_plaintext: None, password_hash,};
+    // The sender becomes the service admin
+    let svc = Service { id: service_id.clone(), name: name.clone(), admin: info.sender.clone(), secret_key, filters: Vec::new(), secrets_plaintext: None, password_hash,};
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
     Ok(Response::new().add_attribute("action","create_service").add_attribute("service_id",service_id).add_attribute("name",name))
 }
