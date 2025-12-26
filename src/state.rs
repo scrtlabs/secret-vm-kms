@@ -180,3 +180,63 @@ pub struct VmRecord {
     /// Optional hex(SHA256(password))
     pub password_hash: Option<String>,
 }
+
+// =============================================================================
+// AMD STORAGE MAPS (STRICTLY SEPARATE)
+// =============================================================================
+
+// 1. AMD Services Map
+const AMD_SERVICES_KEY: &[u8] = b"amd_services_map";
+pub static AMD_SERVICES_MAP: Keymap<String, AmdService> = Keymap::new(AMD_SERVICES_KEY);
+
+// 2. AMD VM Records Map
+const AMD_VM_RECORDS_KEY: &[u8] = b"amd_vm_records_map";
+pub static AMD_VM_RECORDS: Keymap<Vec<u8>, AmdVmRecord> = Keymap::new(AMD_VM_RECORDS_KEY);
+
+// 3. AMD Docker Credentials Map
+pub const AMD_DOCKER_CREDENTIALS_MAP_KEY: &[u8] = b"amd_docker_credentials_by_vm";
+pub static AMD_DOCKER_CREDENTIALS: Keymap<Vec<u8>, AmdDockerCredential> = Keymap::new(AMD_DOCKER_CREDENTIALS_MAP_KEY);
+
+// =============================================================================
+// AMD STRUCTS
+// =============================================================================
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdImageFilter {
+    pub measurement: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdFilterEntry {
+    pub filter: AmdImageFilter,
+    pub description: String,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdService {
+    pub id: String,
+    pub name: String,
+    pub admin: Addr,
+    pub filters: Vec<AmdFilterEntry>,
+    pub secret_key: Vec<u8>,
+    pub secrets_plaintext: Option<String>,
+    pub password_hash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdVmRecord {
+    pub filter: AmdImageFilter,
+    pub secret_key_hex: Option<String>,
+    pub env_plaintext: Option<String>,
+    pub password_hash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdDockerCredential {
+    pub measurement: Vec<u8>,
+    pub vm_uid: Option<Vec<u8>>,
+    pub docker_username: String,
+    pub docker_password_plaintext: String,
+}

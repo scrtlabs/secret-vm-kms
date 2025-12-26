@@ -23,6 +23,13 @@ pub struct MsgImageFilter {
     pub vm_uid: Option<Vec<u8>>,
 }
 
+/// AMD Image Filter: Currently just the measurement (digest) and vm_uid
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdMsgImageFilter {
+    pub measurement: Option<Vec<u8>>,
+    pub vm_uid: Option<Vec<u8>>,
+}
+
 /// Execute messages for the contract.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -42,8 +49,15 @@ pub enum ExecuteMsg {
         username: String,
         password_plaintext: String,
     },
-    /// NEW: add or update env secret for a service
     AddEnvByService { service_id: String, secrets_plaintext: String },
+
+    // --- AMD NEW EXECUTE VARIANTS ---
+    CreateAmdService { service_id: String, name: String, password_hash: Option<String> },
+    AddAmdImageToService { service_id: String, image_filter: AmdMsgImageFilter, description: String, timestamp: Option<u64> },
+    AddAmdEnvByService { service_id: String, secrets_plaintext: String },
+    AddAmdSecretKeyByImage { image_filter: AmdMsgImageFilter, password_hash: Option<String> },
+    AddAmdEnvByImage { image_filter: AmdMsgImageFilter, secrets_plaintext: String, password_hash: Option<String> },
+    AddAmdDockerCredentialsByImage { image_filter: AmdMsgImageFilter, username: String, password_plaintext: String },
 }
 
 /// Query messages for the contract.
@@ -68,6 +82,21 @@ pub enum QueryMsg {
     /// Return filters (with descriptions) for a service
     ListImageFilters { service_id: String },
     GetEnvByService { service_id: String, quote: Vec<u8>, collateral: Vec<u8>, password: Option<String> },
+
+    // --- AMD QUERY VARIANTS ---
+    /// Get AMD Service Info
+    GetAmdService { id: String },
+    /// List AMD Services
+    ListAmdServices {},
+    /// List AMD Filters for a service
+    ListAmdImageFilters { service_id: String },
+
+    // Verification Queries
+    GetSecretKeyAmd { service_id: String, report: String, password: Option<String> },
+    GetSecretKeyByImageAmd { report: String, password: Option<String> },
+    GetEnvByImageAmd { report: String, password: Option<String> },
+    GetDockerCredentialsByImageAmd { report: String },
+    GetEnvByServiceAmd { service_id: String, report: String, password: Option<String> },
 }
 
 /// Migrate message enum for contract migration.
@@ -135,4 +164,23 @@ pub struct DockerCredentialsResponse {
     pub encrypted_username: String,
     pub encrypted_password: String,
     pub encryption_pub_key: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdAttestation {
+    // Base64 of full SNP attestation report bytes
+    pub report_b64: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdListImageResponse {
+    pub service_id: String,
+    pub filters: Vec<AmdImageFilterHexEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct AmdImageFilterHexEntry {
+    pub measurement: Option<String>,
+    pub description: String,
+    pub timestamp: Option<u64>,
 }

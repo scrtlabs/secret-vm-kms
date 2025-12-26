@@ -6,9 +6,10 @@ use core::mem;
 use std::backtrace::Backtrace;
 // use sha2::digest::Update;
 use thiserror::Error;
+use crate::amd_attest::{verify_amd_attestation, AmdAttestationMinimal, VerifiedAmdReport};
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS};
+use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse, AmdMsgImageFilter, AmdListImageResponse, AmdImageFilterHexEntry};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS, AMD_DOCKER_CREDENTIALS, AmdDockerCredential, AMD_VM_RECORDS, AmdImageFilter, AmdVmRecord, AMD_SERVICES_MAP, AmdFilterEntry, AmdService};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -251,7 +252,243 @@ pub fn execute(
         }
         ExecuteMsg::AddEnvByService { service_id, secrets_plaintext } =>
             try_add_env_by_service(deps, env, info, service_id, secrets_plaintext),
+        // --- AMD Handlers (New) ---
+        ExecuteMsg::CreateAmdService { service_id, name, password_hash } =>
+            try_create_amd_service(deps, env, info, service_id, name, password_hash),
+
+        ExecuteMsg::AddAmdImageToService { service_id, image_filter, description, timestamp } =>
+            try_add_amd_filter(deps, env, info, service_id, image_filter, description, timestamp),
+
+        ExecuteMsg::AddAmdEnvByService { service_id, secrets_plaintext } =>
+            try_add_amd_env_by_service(deps, env, info, service_id, secrets_plaintext),
+
+        ExecuteMsg::AddAmdSecretKeyByImage { image_filter, password_hash } =>
+            try_add_amd_secret_key_by_image(deps, env, info, image_filter, password_hash),
+
+        ExecuteMsg::AddAmdEnvByImage { image_filter, secrets_plaintext, password_hash } =>
+            try_add_amd_env_by_image(deps, env, info, image_filter, secrets_plaintext, password_hash),
+
+        ExecuteMsg::AddAmdDockerCredentialsByImage { image_filter, username, password_plaintext } =>
+            try_add_amd_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext),
     }
+}
+
+// -----------------------------------------------------------------------------
+// AMD EXECUTE HANDLERS
+// -----------------------------------------------------------------------------
+
+/// Create a new AMD Service.
+fn try_create_amd_service(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    service_id: String,
+    name: String,
+    password_hash: Option<String>,
+) -> StdResult<Response> {
+    // Check for existing service_id in AMD map
+    if AMD_SERVICES_MAP.contains(deps.storage, &service_id) {
+        return Err(StdError::generic_err("AMD Service ID exists"));
+    }
+
+    // Compute secret_key (same logic as TDX, but independent)
+    let mut hasher = Sha256::new();
+    let mut random_bytes = Vec::new();
+    for bin in env.block.random.iter() {
+        random_bytes.extend_from_slice(bin.as_slice());
+    }
+    sha2::Digest::update(&mut hasher, &random_bytes);
+    sha2::Digest::update(&mut hasher, service_id.as_bytes());
+    let secret_key = hasher.finalize().to_vec();
+
+    let svc = AmdService {
+        id: service_id.clone(),
+        name: name.clone(),
+        admin: info.sender.clone(),
+        secret_key,
+        filters: Vec::new(),
+        secrets_plaintext: None,
+        password_hash,
+    };
+
+    AMD_SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+
+    Ok(Response::new()
+        .add_attribute("action","create_amd_service")
+        .add_attribute("service_id",service_id)
+        .add_attribute("name",name))
+}
+
+/// Add Env secret to AMD Service.
+fn try_add_amd_env_by_service(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    service_id: String,
+    secrets_plaintext: String,
+) -> StdResult<Response> {
+    let mut svc = AMD_SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
+
+    if info.sender.to_string() != svc.admin {
+        return Err(StdError::generic_err("Only the service admin can add service env secret"));
+    }
+
+    svc.secrets_plaintext = Some(secrets_plaintext);
+    AMD_SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "add_amd_env_by_service")
+        .add_attribute("service_id", service_id)
+        .add_attribute("updated", "true"))
+}
+
+/// Add Filter to AMD Service.
+fn try_add_amd_filter(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    service_id: String,
+    image_filter: AmdMsgImageFilter,
+    description: String,
+    timestamp: Option<u64>,
+) -> StdResult<Response> {
+    let mut svc = AMD_SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
+
+    if info.sender.to_string() != svc.admin {
+        return Err(StdError::generic_err("Only the service admin can add image filter"));
+    }
+
+    let entry_filter = AmdImageFilter {
+        measurement: image_filter.measurement.clone(),
+    };
+
+    let ts_to_store = timestamp.or(Some(env.block.time.seconds()));
+
+    svc.filters.push(AmdFilterEntry {
+        filter: entry_filter.clone(),
+        description: description.clone(),
+        timestamp: ts_to_store,
+    });
+
+    AMD_SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "add_amd_image_to_service")
+        .add_attribute("service_id", service_id))
+}
+
+/// Add Secret Key by Image (VM-based) for AMD.
+fn try_add_amd_secret_key_by_image(
+    deps: DepsMut,
+    env: Env,
+    info: MessageInfo,
+    image_filter: AmdMsgImageFilter,
+    password_hash: Option<String>,
+) -> StdResult<Response> {
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only the admin can add a VM secret key"));
+    }
+    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+
+    // Derive key
+    let mut key_hasher = Sha256::new();
+    for bin in env.block.random.iter() { key_hasher.update(bin.as_slice()); }
+    if let Some(v) = &image_filter.measurement { key_hasher.update(v); }
+    key_hasher.update(&vm_uid);
+    let secret_hex = hex::encode(key_hasher.finalize());
+
+    let f = AmdImageFilter { measurement: image_filter.measurement };
+
+    let mut updated = false;
+    let rec = if let Some(mut r) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
+        r.filter = f;
+        r.secret_key_hex = Some(secret_hex);
+        if password_hash.is_some() { r.password_hash = password_hash; }
+        updated = true;
+        r
+    } else {
+        AmdVmRecord { filter: f, secret_key_hex: Some(secret_hex), env_plaintext: None, password_hash }
+    };
+
+    AMD_VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
+    Ok(Response::new().add_attribute("action","add_amd_secret_key_by_image").add_attribute("updated", updated.to_string()))
+}
+
+/// Add Env by Image (VM-based) for AMD.
+fn try_add_amd_env_by_image(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    image_filter: AmdMsgImageFilter,
+    secrets_plaintext: String,
+    password_hash: Option<String>,
+) -> StdResult<Response> {
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only the admin can add env for VM"));
+    }
+    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+
+    let f = AmdImageFilter { measurement: image_filter.measurement };
+
+    let mut updated = false;
+    let rec = if let Some(mut r) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
+        r.filter = f;
+        r.env_plaintext = Some(secrets_plaintext);
+        if password_hash.is_some() { r.password_hash = password_hash; }
+        updated = true;
+        r
+    } else {
+        AmdVmRecord { filter: f, secret_key_hex: None, env_plaintext: Some(secrets_plaintext), password_hash }
+    };
+
+    AMD_VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
+    Ok(Response::new().add_attribute("action","add_amd_env_by_image").add_attribute("updated", updated.to_string()))
+}
+
+/// Add Docker Creds (VM-based) for AMD.
+fn try_add_amd_docker_credentials_by_image(
+    deps: DepsMut,
+    _env: Env,
+    info: MessageInfo,
+    image_filter: AmdMsgImageFilter,
+    username: String,
+    password_plaintext: String,
+) -> StdResult<Response> {
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only the admin can add docker credentials"));
+    }
+
+    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let measurement = image_filter.measurement.ok_or_else(|| StdError::generic_err("measurement required"))?;
+
+    let new_rec = AmdDockerCredential {
+        measurement: measurement.clone(),
+        vm_uid: Some(vm_uid.clone()),
+        docker_username: username.clone(),
+        docker_password_plaintext: password_plaintext.clone(),
+    };
+
+    let mut updated = false;
+    if let Some(mut existing) = AMD_DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
+        existing.measurement = new_rec.measurement.clone();
+        existing.docker_username = new_rec.docker_username.clone();
+        existing.docker_password_plaintext = new_rec.docker_password_plaintext.clone();
+        AMD_DOCKER_CREDENTIALS.insert(deps.storage, &vm_uid, &existing)?;
+        updated = true;
+    } else {
+        AMD_DOCKER_CREDENTIALS.insert(deps.storage, &vm_uid, &new_rec)?;
+    }
+
+    Ok(Response::new()
+        .add_attribute("action", "add_amd_docker_credentials_by_image")
+        .add_attribute("updated", updated.to_string()))
 }
 
 /// handler for adding service-level secret
@@ -758,7 +995,232 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
         QueryMsg::GetEnvByService { service_id, quote, collateral, password } =>
             to_binary(&try_get_env_by_service(deps, env, service_id, quote, collateral, password)?),
+
+        // --- AMD Queries (Strictly AMD Maps) ---
+        QueryMsg::GetAmdService { id } => to_binary(&query_amd_service(deps, id)?),
+        QueryMsg::ListAmdServices {} => to_binary(&query_amd_services(deps)?),
+        QueryMsg::ListAmdImageFilters { service_id } => to_binary(&query_amd_image_filters(deps, service_id)?),
+
+        QueryMsg::GetSecretKeyAmd { service_id, report, password } =>
+            to_binary(&try_get_secret_key_amd(deps, env, service_id, report, password)?),
+        QueryMsg::GetSecretKeyByImageAmd { report, password } =>
+            to_binary(&try_get_secret_key_by_image_amd(deps, env, report, password)?),
+        QueryMsg::GetEnvByImageAmd { report, password } =>
+            to_binary(&try_get_env_by_image_amd(deps, env, report, password)?),
+        QueryMsg::GetDockerCredentialsByImageAmd { report } =>
+            to_binary(&try_get_docker_credentials_by_image_amd(deps, env, report)?),
+        QueryMsg::GetEnvByServiceAmd { service_id, report, password } =>
+            to_binary(&try_get_env_by_service_amd(deps, env, service_id, report, password)?),
     }
+}
+
+// --- AMD Basic Queries ---
+
+fn query_amd_service(deps: Deps, id: String) -> StdResult<ServiceResponse> {
+    let svc = AMD_SERVICES_MAP
+        .get(deps.storage, &id)
+        .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
+    Ok(ServiceResponse { id: svc.id, name: svc.name, admin: svc.admin.into_string() })
+}
+
+fn query_amd_services(deps: Deps) -> StdResult<Vec<ServiceResponse>> {
+    let mut resp: Vec<ServiceResponse> = Vec::new();
+    for result in AMD_SERVICES_MAP.iter(deps.storage)? {
+        let (_key, svc) = result?;
+        resp.push(ServiceResponse {
+            id: svc.id.clone(),
+            name: svc.name.clone(),
+            admin: svc.admin.clone().into_string(),
+        });
+    }
+    Ok(resp)
+}
+
+fn query_amd_image_filters(deps: Deps, service_id: String) -> StdResult<AmdListImageResponse> {
+    let svc = AMD_SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
+
+    let list = svc.filters.iter().map(|entry| {
+        let f = &entry.filter;
+        AmdImageFilterHexEntry {
+            measurement: f.measurement.as_ref().map(|b| hex::encode(b)),
+            description: entry.description.clone(),
+            timestamp: entry.timestamp,
+        }
+    }).collect();
+
+    Ok(AmdListImageResponse { service_id, filters: list })
+}
+
+// --- AMD Verification Logic ---
+
+fn amd_filter_matches(f: &AmdImageFilter, verified: &VerifiedAmdReport) -> bool {
+    if let Some(m) = &f.measurement {
+        if m != &verified.measurement.to_vec() {
+            return false;
+        }
+    }
+    true
+}
+
+// 1. Get Service Secret Key (AMD)
+fn try_get_secret_key_amd(
+    deps: Deps,
+    env: Env,
+    service_id: String,
+    report_b64: String,
+    password: Option<String>,
+) -> StdResult<SecretKeyResponse> {
+    // 1. Verify Report
+    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    // 2. Load Service from AMD Map
+    let svc = AMD_SERVICES_MAP.get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found in AMD map"))?;
+
+    verify_password_opt(&svc.password_hash, &password)?;
+
+    // 3. Match Filter
+    let mut found = false;
+    for entry in svc.filters.iter() {
+        if amd_filter_matches(&entry.filter, &verified) { found = true; break; }
+    }
+    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+
+    // 4. Encrypt
+    let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
+    let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+
+    encrypt_secret(svc.secret_key.clone(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())
+}
+
+// 2. Get Secret Key By Image (AMD)
+fn try_get_secret_key_by_image_amd(
+    deps: Deps,
+    env: Env,
+    report_b64: String,
+    password: Option<String>,
+) -> StdResult<SecretKeyResponse> {
+    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    let vm_uid = verified.report_data[32..48].to_vec();
+
+    if let Some(rec) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
+        verify_password_opt(&rec.password_hash, &password)?;
+        if !amd_filter_matches(&rec.filter, &verified) {
+            return Err(StdError::generic_err("Filter mismatch for VM record"));
+        }
+        let secret_hex = rec.secret_key_hex.ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
+        let secret_bytes = hex::decode(secret_hex).map_err(|_| StdError::generic_err("Stored secret malformed"))?;
+
+        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+
+        return encrypt_secret(secret_bytes, other_pub, &report_bytes, env.block.height.to_string().into_bytes());
+    }
+
+    Err(StdError::generic_err("Secret key for this image has not been created"))
+}
+
+// 3. Get Env By Image (AMD)
+fn try_get_env_by_image_amd(
+    deps: Deps,
+    env: Env,
+    report_b64: String,
+    password: Option<String>,
+) -> StdResult<EnvSecretResponse> {
+    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    let vm_uid = verified.report_data[32..48].to_vec();
+
+    if let Some(rec) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
+        verify_password_opt(&rec.password_hash, &password)?;
+        if !amd_filter_matches(&rec.filter, &verified) {
+            return Err(StdError::generic_err("Filter mismatch for VM record"));
+        }
+        let plain = rec.env_plaintext.ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
+
+        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+
+        let enc = encrypt_secret(plain.into_bytes(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())?;
+        return Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key });
+    }
+
+    Err(StdError::generic_err("No env secret found"))
+}
+
+// 4. Get Docker Credentials (AMD)
+fn try_get_docker_credentials_by_image_amd(
+    deps: Deps,
+    env: Env,
+    report_b64: String,
+) -> StdResult<DockerCredentialsResponse> {
+    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    let vm_uid = verified.report_data[32..48].to_vec();
+    let measurement = verified.measurement.to_vec();
+
+    if let Some(rec) = AMD_DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
+        if rec.measurement != measurement {
+            return Err(StdError::generic_err("Filter mismatch for docker credentials VM record"));
+        }
+
+        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+        let height_bytes = env.block.height.to_string().into_bytes();
+
+        return encrypt_docker_credentials(
+            rec.docker_username,
+            rec.docker_password_plaintext,
+            other_pub,
+            &report_bytes,
+            height_bytes,
+        );
+    }
+
+    Err(StdError::generic_err("No docker credentials found for this image"))
+}
+
+// 5. Get Env By Service (AMD) - Reads AMD_SERVICES_MAP
+fn try_get_env_by_service_amd(
+    deps: Deps,
+    env: Env,
+    service_id: String,
+    report_b64: String,
+    password: Option<String>,
+) -> StdResult<EnvSecretResponse> {
+    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    let svc = AMD_SERVICES_MAP.get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
+
+    verify_password_opt(&svc.password_hash, &password)?;
+
+    let mut found = false;
+    for entry in svc.filters.iter() {
+        if amd_filter_matches(&entry.filter, &verified) { found = true; break; }
+    }
+    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+
+    let plaintext = svc.secrets_plaintext.clone().ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
+
+    let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
+    let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+
+    let enc = encrypt_secret(plaintext.into_bytes(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())?;
+    Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key })
 }
 
 // Helper: filter match vs parsed TDX
@@ -2339,5 +2801,289 @@ mod tests {
         let resp: EnvSecretResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
+    }
+
+    // =========================================================================
+    // AMD TESTS
+    // =========================================================================
+
+    // A valid AMD SEV-SNP Report (Base64) matching the hardcoded certificates in amd_attest.rs
+    // Measurement: 45fcf00a5bc0888f451cddaecba9a9f783543e72b319e14df388c82a3dcebbd348b0b0c5aef22c5432e65c8997fe6fc6
+    const VALID_AMD_REPORT_B64: &str = "AwAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAJAAAAAAAXSCcAAAAAAAAAAAAAAAAAAAACeDeESh3+s2BOgyl00cecxRfl4tTUlYiJZD4XcWD+NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARfzwClvAiI9FHN2uy6mp94NUPnKzGeFN84jIKj3Ou9NIsLDFrvIsVDLmXImX/m/GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABiVRLNzxQCo/Ld3rkBXFn9U7kSgO4TOP8AKnqTleNnk///////////////////////////////////////////CQAAAAAAF0gZEQEAAAAAAAAAAAAAAAAAAAAAAAAAAACvcHTqpO6FT+BKGvSEX2JkXa2Yg/MNRbPYqkfltgmTo2gMTrCo6UXD9lMkAJtxE/W37TYGJ/PL+WliY7NYWmKjCQAAAAAAF0gnNwEAJzcBAAkAAAAAABdIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAmvkwlMgGTaEGGO7x1whLf5hbvXDwNp514Rnc/70W779+Yi5iPS3cR0K5n3EmA+siAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATV33Rm6swqfKHv4N9neM7/9lWog7vxhygd0awl1XQrSP0IT9PqMJ6rD1dphA5ff8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    const EXPECTED_AMD_MEASUREMENT_HEX: &str = "45fcf00a5bc0888f451cddaecba9a9f783543e72b319e14df388c82a3dcebbd348b0b0c5aef22c5432e65c8997fe6fc6";
+
+    #[test]
+    fn amd_create_service_and_list() {
+        let mut deps = mock_dependencies();
+        let info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), info.clone(), InstantiateMsg {}).unwrap();
+
+        // 1. Create AMD Service
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            info.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: "amd-svc-1".to_string(),
+                name: "AMD Service".to_string(),
+                password_hash: None,
+            },
+        ).unwrap();
+
+        // 2. Add Filter
+        let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            info.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: "amd-svc-1".to_string(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement.clone()),
+                    vm_uid: None,
+                },
+                description: "Initial AMD Filter".to_string(),
+                timestamp: None,
+            },
+        ).unwrap();
+
+        // 3. List Services (Verify isolation from TDX maps)
+        let tdx_list = query_services(deps.as_ref()).unwrap();
+        assert_eq!(tdx_list.len(), 0, "AMD service should not appear in TDX list");
+
+        let amd_list = query_amd_services(deps.as_ref()).unwrap();
+        assert_eq!(amd_list.len(), 1);
+        assert_eq!(amd_list[0].id, "amd-svc-1");
+
+        // 4. List Filters
+        let filters = query_amd_image_filters(deps.as_ref(), "amd-svc-1".to_string()).unwrap();
+        assert_eq!(filters.filters.len(), 1);
+        assert_eq!(filters.filters[0].description, "Initial AMD Filter");
+        assert_eq!(filters.filters[0].measurement, Some(EXPECTED_AMD_MEASUREMENT_HEX.to_string()));
+    }
+
+    #[test]
+    fn amd_get_secret_key_service_flow() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        // 1. Setup Service
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: "amd-svc-key".to_string(),
+                name: "Key Service".to_string(),
+                password_hash: None,
+            },
+        ).unwrap();
+
+        // 2. Add matching filter (Measurement from VALID_AMD_REPORT_B64)
+        let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: "amd-svc-key".to_string(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement),
+                    vm_uid: None,
+                },
+                description: "Valid Filter".to_string(),
+                timestamp: None,
+            },
+        ).unwrap();
+
+        // 3. Get Secret Key
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-svc-key".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: None,
+            },
+        ).unwrap();
+
+        let key_resp: SecretKeyResponse = from_binary(&res).unwrap();
+        assert!(!key_resp.encrypted_secret_key.is_empty());
+        assert!(!key_resp.encryption_pub_key.is_empty());
+    }
+
+    #[test]
+    fn amd_get_env_by_image_flow() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+        let vm_uid = vec![0u8; 16];
+        let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdEnvByImage {
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement.clone()),
+                    vm_uid: Some(vm_uid.clone()),
+                },
+                secrets_plaintext: "AMD_ENV_VAR=SUCCESS".to_string(),
+                password_hash: None,
+            },
+        ).unwrap();
+
+        // Query
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByImageAmd {
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: None,
+            },
+        ).unwrap();
+
+        let env_resp: EnvSecretResponse = from_binary(&res).unwrap();
+        assert!(!env_resp.encrypted_secrets_plaintext.is_empty());
+    }
+
+    #[test]
+    fn amd_password_protection() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        let pwd_plain = "secret-amd";
+        let pwd_hash = sha256_hex(pwd_plain);
+
+        // Create service with password
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: "amd-pwd".to_string(),
+                name: "Secure AMD".to_string(),
+                password_hash: Some(pwd_hash),
+            },
+        ).unwrap();
+
+        let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: "amd-pwd".to_string(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement),
+                    vm_uid: None,
+                },
+                description: "desc".to_string(),
+                timestamp: None,
+            },
+        ).unwrap();
+
+        // 1. Fail without password
+        let err = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-pwd".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: None,
+            },
+        ).unwrap_err();
+        assert_eq!(err.to_string(), "Generic error: Password required");
+
+        // 2. Fail with wrong password
+        let err = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-pwd".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: Some("wrong".to_string()),
+            },
+        ).unwrap_err();
+        assert_eq!(err.to_string(), "Generic error: Password mismatch");
+
+        // 3. Success
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-pwd".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: Some(pwd_plain.to_string()),
+            },
+        ).unwrap();
+        let resp: SecretKeyResponse = from_binary(&res).unwrap();
+        assert!(!resp.encrypted_secret_key.is_empty());
+    }
+
+    #[test]
+    fn amd_get_env_by_service() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        let service_id = "amd-svc-env".to_string();
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: service_id.clone(),
+                name: "Env Service".to_string(),
+                password_hash: None,
+            },
+        ).unwrap();
+
+        // Add filter so the report matches
+        let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: service_id.clone(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement),
+                    vm_uid: None,
+                },
+                description: "filter".to_string(),
+                timestamp: None,
+            },
+        ).unwrap();
+
+        // Add Service Env
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdEnvByService {
+                service_id: service_id.clone(),
+                secrets_plaintext: "SERVICE_SECRET=123".to_string(),
+            },
+        ).unwrap();
+
+        // Query
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByServiceAmd {
+                service_id: service_id,
+                report: VALID_AMD_REPORT_B64.to_string(),
+                password: None,
+            },
+        ).unwrap();
+
+        let resp: EnvSecretResponse = from_binary(&res).unwrap();
+        assert!(!resp.encrypted_secrets_plaintext.is_empty());
     }
 }

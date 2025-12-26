@@ -5,6 +5,7 @@ use std::result;
 use aes_siv::aead::generic_array::GenericArray;
 use aes_siv::siv::Aes128Siv;
 use log::warn;
+use aes_siv::aead::KeyInit;
 use sha2::{Digest, Sha256};
 // use x25519_dalek;
 
@@ -323,7 +324,7 @@ fn aes_siv_encrypt(
 ) -> Result<Vec<u8>, CryptoError> {
     let ad = ad.unwrap_or(&[&[]]);
 
-    let mut cipher = Aes128Siv::new(GenericArray::clone_from_slice(key));
+    let mut cipher = <Aes128Siv as KeyInit>::new(GenericArray::from_slice(key));
     cipher.encrypt(ad, plaintext).map_err(|e| {
         warn!("aes_siv_encrypt error: {:?}", e);
         CryptoError::EncryptionError
@@ -337,7 +338,7 @@ fn aes_siv_decrypt(
 ) -> Result<Vec<u8>, CryptoError> {
     let ad = ad.unwrap_or(&[&[]]);
 
-    let mut cipher = Aes128Siv::new(GenericArray::clone_from_slice(key));
+    let mut cipher = <Aes128Siv as KeyInit>::new(GenericArray::from_slice(key));
     cipher.decrypt(ad, ciphertext).map_err(|e| {
         warn!("aes_siv_decrypt error: {:?}", e);
         CryptoError::DecryptionError
