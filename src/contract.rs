@@ -270,7 +270,40 @@ pub fn execute(
 
         ExecuteMsg::AddAmdDockerCredentialsByImage { image_filter, username, password_plaintext } =>
             try_add_amd_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext),
+        ExecuteMsg::TestAmdVerification { report } =>
+            try_test_amd_verification(deps, env, info, report),
     }
+}
+
+/// Unlike a query, this consumes gas and records the result in the blockchain transaction logs (events).
+/// It will revert the transaction if verification fails.
+fn try_test_amd_verification(
+    _deps: DepsMut,
+    _env: Env,
+    _info: MessageInfo,
+    report_b64: String,
+) -> StdResult<Response> {
+    // 1. Wrap the base64 input string into the struct expected by the verifier logic.
+    let att = AmdAttestationMinimal { report_b64 };
+
+    // 2. Call the core verification logic imported from `amd_attest.rs`.
+    // If verification fails (invalid signature, wrong chain, etc.), this returns an Err,
+    // which stops execution and reverts the transaction.
+    let verified = verify_amd_attestation(&att)
+        .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
+
+    // 3. Encode the raw byte arrays (measurement and report_data) into Hex strings.
+    // This makes them human-readable in the transaction response/logs.
+    let measurement_hex = hex::encode(verified.measurement);
+    let report_data_hex = hex::encode(verified.report_data);
+
+    // 4. Construct the successful response.
+    // We add the extracted data as attributes so the caller can verify what the contract "sees".
+    Ok(Response::new()
+        .add_attribute("action", "test_amd_verification")
+        .add_attribute("status", "success")
+        .add_attribute("measurement", measurement_hex)
+        .add_attribute("report_data", report_data_hex))
 }
 
 // -----------------------------------------------------------------------------

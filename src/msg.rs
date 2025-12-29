@@ -58,6 +58,10 @@ pub enum ExecuteMsg {
     AddAmdSecretKeyByImage { image_filter: AmdMsgImageFilter, password_hash: Option<String> },
     AddAmdEnvByImage { image_filter: AmdMsgImageFilter, secrets_plaintext: String, password_hash: Option<String> },
     AddAmdDockerCredentialsByImage { image_filter: AmdMsgImageFilter, username: String, password_plaintext: String },
+    // --- TEST HANDLER ---
+    /// Test endpoint to verify an AMD report during execution.
+    /// Returns the parsed measurement and report_data via transaction attributes.
+    TestAmdVerification { report: String },
 }
 
 /// Query messages for the contract.
