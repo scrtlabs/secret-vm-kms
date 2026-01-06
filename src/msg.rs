@@ -58,10 +58,14 @@ pub enum ExecuteMsg {
     AddAmdSecretKeyByImage { image_filter: AmdMsgImageFilter, password_hash: Option<String> },
     AddAmdEnvByImage { image_filter: AmdMsgImageFilter, secrets_plaintext: String, password_hash: Option<String> },
     AddAmdDockerCredentialsByImage { image_filter: AmdMsgImageFilter, username: String, password_plaintext: String },
-    // --- TEST HANDLER ---
+    // --- TEST HANDLER (UPDATED) ---
     /// Test endpoint to verify an AMD report during execution.
-    /// Returns the parsed measurement and report_data via transaction attributes.
-    TestAmdVerification { report: String },
+    /// Now requires certificates (ASK and VCEK) in PEM format (Base64 encoded).
+    TestAmdVerification {
+        report: String,
+        ask_pem: String,
+        vcek_pem: String,
+    },
 }
 
 /// Query messages for the contract.
@@ -96,11 +100,11 @@ pub enum QueryMsg {
     ListAmdImageFilters { service_id: String },
 
     // Verification Queries
-    GetSecretKeyAmd { service_id: String, report: String, password: Option<String> },
-    GetSecretKeyByImageAmd { report: String, password: Option<String> },
-    GetEnvByImageAmd { report: String, password: Option<String> },
-    GetDockerCredentialsByImageAmd { report: String },
-    GetEnvByServiceAmd { service_id: String, report: String, password: Option<String> },
+    GetSecretKeyAmd { service_id: String, report: String, ask_pem: String, vcek_pem: String,password: Option<String> },
+    GetSecretKeyByImageAmd { report: String, ask_pem: String, vcek_pem: String, password: Option<String> },
+    GetEnvByImageAmd { report: String,ask_pem: String, vcek_pem: String, password: Option<String> },
+    GetDockerCredentialsByImageAmd { report: String, ask_pem: String, vcek_pem: String},
+    GetEnvByServiceAmd { service_id: String, report: String, ask_pem: String, vcek_pem: String, password: Option<String> },
 }
 
 /// Migrate message enum for contract migration.

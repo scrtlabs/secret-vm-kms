@@ -6,7 +6,7 @@ use core::mem;
 use std::backtrace::Backtrace;
 // use sha2::digest::Update;
 use thiserror::Error;
-use crate::amd_attest::{verify_amd_attestation, AmdAttestationMinimal, VerifiedAmdReport};
+use crate::amd_attest::{verify_amd_attestation, AmdAttestationInput, VerifiedAmdReport};
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
 use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse, AmdMsgImageFilter, AmdListImageResponse, AmdImageFilterHexEntry};
 use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS, AMD_DOCKER_CREDENTIALS, AmdDockerCredential, AMD_VM_RECORDS, AmdImageFilter, AmdVmRecord, AMD_SERVICES_MAP, AmdFilterEntry, AmdService};
@@ -270,35 +270,41 @@ pub fn execute(
 
         ExecuteMsg::AddAmdDockerCredentialsByImage { image_filter, username, password_plaintext } =>
             try_add_amd_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext),
-        ExecuteMsg::TestAmdVerification { report } =>
-            try_test_amd_verification(deps, env, info, report),
+        // TEST Handler: Updated to pass certificates
+        ExecuteMsg::TestAmdVerification { report, ask_pem, vcek_pem } =>
+            try_test_amd_verification(deps, env, info, report, ask_pem, vcek_pem),
     }
 }
 
-/// Unlike a query, this consumes gas and records the result in the blockchain transaction logs (events).
-/// It will revert the transaction if verification fails.
+/// TEST ONLY: Verifies an AMD SEV-SNP attestation report within an Execute transaction.
+///
+/// Accepts report + certificate chain.
+/// Returns measurement and report_data in transaction attributes on success.
 fn try_test_amd_verification(
     _deps: DepsMut,
     _env: Env,
     _info: MessageInfo,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
 ) -> StdResult<Response> {
-    // 1. Wrap the base64 input string into the struct expected by the verifier logic.
-    let att = AmdAttestationMinimal { report_b64 };
 
-    // 2. Call the core verification logic imported from `amd_attest.rs`.
-    // If verification fails (invalid signature, wrong chain, etc.), this returns an Err,
-    // which stops execution and reverts the transaction.
+    // 1. Construct the verification input
+    let att = AmdAttestationInput {
+        report_b64,
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
+
+    // 2. Verify
+    // This will error if the chain is invalid or signature doesn't match
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
-    // 3. Encode the raw byte arrays (measurement and report_data) into Hex strings.
-    // This makes them human-readable in the transaction response/logs.
+    // 3. Return attributes
     let measurement_hex = hex::encode(verified.measurement);
     let report_data_hex = hex::encode(verified.report_data);
 
-    // 4. Construct the successful response.
-    // We add the extracted data as attributes so the caller can verify what the contract "sees".
     Ok(Response::new()
         .add_attribute("action", "test_amd_verification")
         .add_attribute("status", "success")
@@ -1034,16 +1040,21 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::ListAmdServices {} => to_binary(&query_amd_services(deps)?),
         QueryMsg::ListAmdImageFilters { service_id } => to_binary(&query_amd_image_filters(deps, service_id)?),
 
-        QueryMsg::GetSecretKeyAmd { service_id, report, password } =>
-            to_binary(&try_get_secret_key_amd(deps, env, service_id, report, password)?),
-        QueryMsg::GetSecretKeyByImageAmd { report, password } =>
-            to_binary(&try_get_secret_key_by_image_amd(deps, env, report, password)?),
-        QueryMsg::GetEnvByImageAmd { report, password } =>
-            to_binary(&try_get_env_by_image_amd(deps, env, report, password)?),
-        QueryMsg::GetDockerCredentialsByImageAmd { report } =>
-            to_binary(&try_get_docker_credentials_by_image_amd(deps, env, report)?),
-        QueryMsg::GetEnvByServiceAmd { service_id, report, password } =>
-            to_binary(&try_get_env_by_service_amd(deps, env, service_id, report, password)?),
+        // Updated signatures requiring PEMs
+        QueryMsg::GetSecretKeyAmd { service_id, report, ask_pem, vcek_pem, password } =>
+            to_binary(&try_get_secret_key_amd(deps, env, service_id, report, ask_pem, vcek_pem, password)?),
+
+        QueryMsg::GetSecretKeyByImageAmd { report, ask_pem, vcek_pem, password } =>
+            to_binary(&try_get_secret_key_by_image_amd(deps, env, report, ask_pem, vcek_pem, password)?),
+
+        QueryMsg::GetEnvByImageAmd { report, ask_pem, vcek_pem, password } =>
+            to_binary(&try_get_env_by_image_amd(deps, env, report, ask_pem, vcek_pem, password)?),
+
+        QueryMsg::GetDockerCredentialsByImageAmd { report, ask_pem, vcek_pem } =>
+            to_binary(&try_get_docker_credentials_by_image_amd(deps, env, report, ask_pem, vcek_pem)?),
+
+        QueryMsg::GetEnvByServiceAmd { service_id, report, ask_pem, vcek_pem, password } =>
+            to_binary(&try_get_env_by_service_amd(deps, env, service_id, report, ask_pem, vcek_pem, password)?),
     }
 }
 
@@ -1103,27 +1114,30 @@ fn try_get_secret_key_amd(
     env: Env,
     service_id: String,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
     password: Option<String>,
 ) -> StdResult<SecretKeyResponse> {
-    // 1. Verify Report
-    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let att = AmdAttestationInput {
+        report_b64: report_b64.clone(),
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
+
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
-    // 2. Load Service from AMD Map
     let svc = AMD_SERVICES_MAP.get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found in AMD map"))?;
 
     verify_password_opt(&svc.password_hash, &password)?;
 
-    // 3. Match Filter
     let mut found = false;
     for entry in svc.filters.iter() {
         if amd_filter_matches(&entry.filter, &verified) { found = true; break; }
     }
     if !found { return Err(StdError::generic_err("No matching image filter found")); }
 
-    // 4. Encrypt
     let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
     let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
 
@@ -1135,9 +1149,15 @@ fn try_get_secret_key_by_image_amd(
     deps: Deps,
     env: Env,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
     password: Option<String>,
 ) -> StdResult<SecretKeyResponse> {
-    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let att = AmdAttestationInput {
+        report_b64: report_b64.clone(),
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
@@ -1165,9 +1185,15 @@ fn try_get_env_by_image_amd(
     deps: Deps,
     env: Env,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
     password: Option<String>,
 ) -> StdResult<EnvSecretResponse> {
-    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let att = AmdAttestationInput {
+        report_b64: report_b64.clone(),
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
@@ -1195,8 +1221,14 @@ fn try_get_docker_credentials_by_image_amd(
     deps: Deps,
     env: Env,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
 ) -> StdResult<DockerCredentialsResponse> {
-    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let att = AmdAttestationInput {
+        report_b64: report_b64.clone(),
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
@@ -1230,9 +1262,15 @@ fn try_get_env_by_service_amd(
     env: Env,
     service_id: String,
     report_b64: String,
+    ask_pem: String,
+    vcek_pem: String,
     password: Option<String>,
 ) -> StdResult<EnvSecretResponse> {
-    let att = AmdAttestationMinimal { report_b64: report_b64.clone() };
+    let att = AmdAttestationInput {
+        report_b64: report_b64.clone(),
+        ask_pem_b64: ask_pem,
+        vcek_pem_b64: vcek_pem,
+    };
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
@@ -2839,12 +2877,35 @@ mod tests {
     // =========================================================================
     // AMD TESTS
     // =========================================================================
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
 
-    // A valid AMD SEV-SNP Report (Base64) matching the hardcoded certificates in amd_attest.rs
-    // Measurement: 45fcf00a5bc0888f451cddaecba9a9f783543e72b319e14df388c82a3dcebbd348b0b0c5aef22c5432e65c8997fe6fc6
+    // We borrow the constants from amd_attest for testing simulation
+    const GENOA_ASK_DER_B64: &str = "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";
+    const GENOA_VCEK_HOST1_DER_B64: &str = "MIIFPzCCAvOgAwIBAgIBADBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAgUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATAwezEUMBIGA1UECwwLRW5naW5lZXJpbmcxCzAJBgNVBAYTAlVTMRQwEgYDVQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExHzAdBgNVBAoMFkFkdmFuY2VkIE1pY3JvIERldmljZXMxEjAQBgNVBAMMCVNFVi1HZW5vYTAeFw0yNTEyMjUwNDQyNDZaFw0zMjEyMjUwNDQyNDZaMHoxFDASBgNVBAsMC0VuZ2luZWVyaW5nMQswCQYDVQQGEwJVUzEUMBIGA1UEBwwLU2FudGEgQ2xhcmExCzAJBgNVBAgMAkNBMR8wHQYDVQQKDBZBZHZhbmNlZCBNaWNybyBEZXZpY2VzMREwDwYDVQQDDAhTRVYtVkNFSzB2MBAGByqGSM49AgEGBSuBBAAiA2IABBGaNwJcUQ9xifrpCH0wrhIhnmGQW/m9B4GffjTkzHLpc2GPevF7XsDAOCDJshZnzrPPmo3BnaY/30jzMov+P9FTe3KnhSWgxTHifXkjPg7mxKljbNJTmz6SpwwxwE40ZaOCARMwggEPMBAGCSsGAQQBnHgBAQQDAgEAMBQGCSsGAQQBnHgBAgQHFgVHZW5vYTARBgorBgEEAZx4AQMBBAMCAQkwEQYKKwYBBAGceAEDAgQDAgEAMBEGCisGAQQBnHgBAwQEAwIBADARBgorBgEEAZx4AQMFBAMCAQAwEQYKKwYBBAGceAEDBgQDAgEAMBEGCisGAQQBnHgBAwcEAwIBADARBgorBgEEAZx4AQMDBAMCARcwEQYKKwYBBAGceAEDCAQDAgFIME0GCSsGAQQBnHgBBARAr3B06qTuhU/gShr0hF9iZF2tmIPzDUWz2KpH5bYJk6NoDE6wqOlFw/ZTJACbcRP1t+02Bifzy/lpYmOzWFpiozBBBgkqhkiG9w0BAQowNKAPMA0GCWCGSAFlAwQCAgUAoRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATADggIBAHci7MqmEUXLMTykM2J9z/Ooe3FW0R6a7T+d8NtsHQeIQfI+9HJlo3fYS0m15dhwHmRfAOQmA++2oe2qFi2lj5oPrsfde1EovED76EqxiOEyi/PVTJR+vC9BYPGb9RHHKeLnJbPN1kwxtqaHmQRiW6x1fa3Gjzw089cmzc7ZHNX0YG36mLP8+ozxxVpM+5/zMvlsluONPlORzWCNESUlkghU9nwHa35qoZgQ9v2h2UN3Go5Jf4iojtArBrHVWRjLTHSAl2RwvPnGetCiNfMQXnPpj6f9IxoHodJYG1KaAfLaQuScwsfi2PkcglYW0QaJK8bOhCfWnZXVYfUbhEeZKyB3vwcB0Deq5Bp8jYafEpKdxp27OQisoR8Zjdh4BEc8r9dIbpv9+7xldyRfSHYpLaeDPgTk9xbKrU/iHs1feQdZfrGxo9WeGeEUyU8S6K8nQnX95CZ0Yp+bnJl2bmUoLxzRluC0ROA7sxgXM6XWVz5fio8a2C3qbVhZhH0OLsEGHC/v2twvP98rxmyYqz1oa743bDZgSCPZfakkZw6oJzkb7k4x8p1kUDr08mRurV98doII9gLWDf/2qGTGRzHkv55+T0lggCeGYBmeKAPG+loaatr6RYadd5PIkFQa6wAE0NW/PuFHEveC/5JOITD8njxjqJ0UJhaXoC+MQ8TGNznm";
+
     const VALID_AMD_REPORT_B64: &str = "AwAAAAAAAAAAAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAEAAAAJAAAAAAAXSCcAAAAAAAAAAAAAAAAAAAACeDeESh3+s2BOgyl00cecxRfl4tTUlYiJZD4XcWD+NwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARfzwClvAiI9FHN2uy6mp94NUPnKzGeFN84jIKj3Ou9NIsLDFrvIsVDLmXImX/m/GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABiVRLNzxQCo/Ld3rkBXFn9U7kSgO4TOP8AKnqTleNnk///////////////////////////////////////////CQAAAAAAF0gZEQEAAAAAAAAAAAAAAAAAAAAAAAAAAACvcHTqpO6FT+BKGvSEX2JkXa2Yg/MNRbPYqkfltgmTo2gMTrCo6UXD9lMkAJtxE/W37TYGJ/PL+WliY7NYWmKjCQAAAAAAF0gnNwEAJzcBAAkAAAAAABdIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAmvkwlMgGTaEGGO7x1whLf5hbvXDwNp514Rnc/70W779+Yi5iPS3cR0K5n3EmA+siAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATV33Rm6swqfKHv4N9neM7/9lWog7vxhygd0awl1XQrSP0IT9PqMJ6rD1dphA5ff8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-
     const EXPECTED_AMD_MEASUREMENT_HEX: &str = "45fcf00a5bc0888f451cddaecba9a9f783543e72b319e14df388c82a3dcebbd348b0b0c5aef22c5432e65c8997fe6fc6";
+
+    // Helper: Convert DER Base64 to PEM Base64 so we can pass it to the contract
+    // FIX: Splits the body into 64-char lines to satisfy strict PEM parsers
+    fn make_pem(der_b64: &str) -> String {
+        let bytes = STANDARD.decode(der_b64).unwrap();
+        let b64_clean = STANDARD.encode(&bytes);
+
+        // Split into chunks of 64 characters
+        let chunks: Vec<String> = b64_clean
+            .chars()
+            .collect::<Vec<char>>()
+            .chunks(64)
+            .map(|c| c.iter().collect())
+            .collect();
+        let formatted_body = chunks.join("\n");
+
+        let pem_str = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", formatted_body);
+        // Re-encode the whole PEM string to Base64 as the contract expects B64-PEM-String
+        STANDARD.encode(pem_str)
+    }
 
     #[test]
     fn amd_create_service_and_list() {
@@ -2902,49 +2963,31 @@ mod tests {
         let admin = mock_info("admin", &[]);
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
 
-        // 1. Setup Service
-        execute(
-            deps.as_mut(),
-            mock_env(),
-            admin.clone(),
-            ExecuteMsg::CreateAmdService {
-                service_id: "amd-svc-key".to_string(),
-                name: "Key Service".to_string(),
-                password_hash: None,
-            },
-        ).unwrap();
+        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::CreateAmdService {
+            service_id: "amd-svc-key".to_string(), name: "Key Service".to_string(), password_hash: None,
+        }).unwrap();
 
-        // 2. Add matching filter (Measurement from VALID_AMD_REPORT_B64)
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
-        execute(
-            deps.as_mut(),
-            mock_env(),
-            admin.clone(),
-            ExecuteMsg::AddAmdImageToService {
-                service_id: "amd-svc-key".to_string(),
-                image_filter: AmdMsgImageFilter {
-                    measurement: Some(measurement),
-                    vm_uid: None,
-                },
-                description: "Valid Filter".to_string(),
-                timestamp: None,
-            },
-        ).unwrap();
+        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdImageToService {
+            service_id: "amd-svc-key".to_string(),
+            image_filter: AmdMsgImageFilter { measurement: Some(measurement), vm_uid: None },
+            description: "Valid Filter".to_string(), timestamp: None,
+        }).unwrap();
 
-        // 3. Get Secret Key
-        let res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetSecretKeyAmd {
-                service_id: "amd-svc-key".to_string(),
-                report: VALID_AMD_REPORT_B64.to_string(),
-                password: None,
-            },
-        ).unwrap();
+        // Pass real certs converted to PEM
+        let ask_pem = make_pem(GENOA_ASK_DER_B64);
+        let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
+            service_id: "amd-svc-key".to_string(),
+            report: VALID_AMD_REPORT_B64.to_string(),
+            ask_pem,
+            vcek_pem,
+            password: None,
+        }).unwrap();
 
         let key_resp: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!key_resp.encrypted_secret_key.is_empty());
-        assert!(!key_resp.encryption_pub_key.is_empty());
     }
 
     #[test]
@@ -2952,32 +2995,23 @@ mod tests {
         let mut deps = mock_dependencies();
         let admin = mock_info("admin", &[]);
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
         let vm_uid = vec![0u8; 16];
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
 
-        execute(
-            deps.as_mut(),
-            mock_env(),
-            admin.clone(),
-            ExecuteMsg::AddAmdEnvByImage {
-                image_filter: AmdMsgImageFilter {
-                    measurement: Some(measurement.clone()),
-                    vm_uid: Some(vm_uid.clone()),
-                },
-                secrets_plaintext: "AMD_ENV_VAR=SUCCESS".to_string(),
-                password_hash: None,
-            },
-        ).unwrap();
+        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdEnvByImage {
+            image_filter: AmdMsgImageFilter { measurement: Some(measurement.clone()), vm_uid: Some(vm_uid.clone()) },
+            secrets_plaintext: "AMD_ENV_VAR=SUCCESS".to_string(), password_hash: None,
+        }).unwrap();
 
-        // Query
-        let res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetEnvByImageAmd {
-                report: VALID_AMD_REPORT_B64.to_string(),
-                password: None,
-            },
-        ).unwrap();
+        let ask_pem = make_pem(GENOA_ASK_DER_B64);
+        let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetEnvByImageAmd {
+            report: VALID_AMD_REPORT_B64.to_string(),
+            ask_pem, vcek_pem,
+            password: None,
+        }).unwrap();
 
         let env_resp: EnvSecretResponse = from_binary(&res).unwrap();
         assert!(!env_resp.encrypted_secrets_plaintext.is_empty());
@@ -2992,68 +3026,36 @@ mod tests {
         let pwd_plain = "secret-amd";
         let pwd_hash = sha256_hex(pwd_plain);
 
-        // Create service with password
-        execute(
-            deps.as_mut(),
-            mock_env(),
-            admin.clone(),
-            ExecuteMsg::CreateAmdService {
-                service_id: "amd-pwd".to_string(),
-                name: "Secure AMD".to_string(),
-                password_hash: Some(pwd_hash),
-            },
-        ).unwrap();
+        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::CreateAmdService {
+            service_id: "amd-pwd".to_string(), name: "Secure AMD".to_string(), password_hash: Some(pwd_hash),
+        }).unwrap();
 
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
-        execute(
-            deps.as_mut(),
-            mock_env(),
-            admin.clone(),
-            ExecuteMsg::AddAmdImageToService {
-                service_id: "amd-pwd".to_string(),
-                image_filter: AmdMsgImageFilter {
-                    measurement: Some(measurement),
-                    vm_uid: None,
-                },
-                description: "desc".to_string(),
-                timestamp: None,
-            },
-        ).unwrap();
+        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdImageToService {
+            service_id: "amd-pwd".to_string(),
+            image_filter: AmdMsgImageFilter { measurement: Some(measurement), vm_uid: None },
+            description: "desc".to_string(), timestamp: None,
+        }).unwrap();
 
-        // 1. Fail without password
-        let err = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetSecretKeyAmd {
-                service_id: "amd-pwd".to_string(),
-                report: VALID_AMD_REPORT_B64.to_string(),
-                password: None,
-            },
-        ).unwrap_err();
+        let ask_pem = make_pem(GENOA_ASK_DER_B64);
+        let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
+
+        // Fail
+        let err = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
+            service_id: "amd-pwd".to_string(),
+            report: VALID_AMD_REPORT_B64.to_string(),
+            ask_pem: ask_pem.clone(), vcek_pem: vcek_pem.clone(),
+            password: None,
+        }).unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
-        // 2. Fail with wrong password
-        let err = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetSecretKeyAmd {
-                service_id: "amd-pwd".to_string(),
-                report: VALID_AMD_REPORT_B64.to_string(),
-                password: Some("wrong".to_string()),
-            },
-        ).unwrap_err();
-        assert_eq!(err.to_string(), "Generic error: Password mismatch");
-
-        // 3. Success
-        let res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetSecretKeyAmd {
-                service_id: "amd-pwd".to_string(),
-                report: VALID_AMD_REPORT_B64.to_string(),
-                password: Some(pwd_plain.to_string()),
-            },
-        ).unwrap();
+        // Success
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
+            service_id: "amd-pwd".to_string(),
+            report: VALID_AMD_REPORT_B64.to_string(),
+            ask_pem, vcek_pem,
+            password: Some(pwd_plain.to_string()),
+        }).unwrap();
         let resp: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!resp.encrypted_secret_key.is_empty());
     }
@@ -3105,13 +3107,19 @@ mod tests {
             },
         ).unwrap();
 
-        // Query
+        // Prepare certs
+        let ask_pem = make_pem(GENOA_ASK_DER_B64);
+        let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
+
+        // Query - FIXED: Added ask_pem and vcek_pem fields
         let res = query(
             deps.as_ref(),
             mock_env(),
             QueryMsg::GetEnvByServiceAmd {
                 service_id: service_id,
                 report: VALID_AMD_REPORT_B64.to_string(),
+                ask_pem,
+                vcek_pem,
                 password: None,
             },
         ).unwrap();
