@@ -1,8 +1,8 @@
 use cosmwasm_std::{Addr, StdResult, Storage};
 use cosmwasm_storage::{singleton, singleton_read, ReadonlySingleton, Singleton};
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use secret_toolkit::storage::Keymap;
+use serde::{Deserialize, Serialize};
 
 static GLOBAL_STATE_KEY: &[u8] = b"global_state";
 // ---------- Services maps ----------
@@ -14,7 +14,7 @@ const NEW_SERVICES_KEY: &[u8] = b"services_map_with_password";
 
 // Keep names the same to avoid wide renames:
 pub static OLD_SERVICES_MAP: Keymap<String, OldService> = Keymap::new(OLD_SERVICES_KEY);
-pub static SERVICES_MAP:     Keymap<String, Service>    = Keymap::new(NEW_SERVICES_KEY);
+pub static SERVICES_MAP: Keymap<String, Service> = Keymap::new(NEW_SERVICES_KEY);
 
 // ---------- VM unified records (NEW Keymap), but name kept simple ----------
 const VM_RECORDS_KEY: &[u8] = b"vm_records_map";
@@ -182,6 +182,22 @@ pub struct VmRecord {
 }
 
 // =============================================================================
+// TDX HARDWARE REGISTERS WHITELIST
+// =============================================================================
+
+// Whitelist for (mr_td, rtmr0) pairs in hex format
+const HW_REGISTERS_WHITELIST_KEY: &[u8] = b"hw_registers_whitelist";
+pub static HW_REGISTERS_WHITELIST: Keymap<HwRegisterPair, bool> =
+    Keymap::new(HW_REGISTERS_WHITELIST_KEY);
+
+/// Structure representing a pair of hardware registers (mr_td, rtmr0) for whitelist
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, JsonSchema)]
+pub struct HwRegisterPair {
+    pub mr_td: String, // hex string
+    pub rtmr0: String, // hex string
+}
+
+// =============================================================================
 // AMD STORAGE MAPS (STRICTLY SEPARATE)
 // =============================================================================
 
@@ -195,7 +211,8 @@ pub static AMD_VM_RECORDS: Keymap<Vec<u8>, AmdVmRecord> = Keymap::new(AMD_VM_REC
 
 // 3. AMD Docker Credentials Map
 pub const AMD_DOCKER_CREDENTIALS_MAP_KEY: &[u8] = b"amd_docker_credentials_by_vm";
-pub static AMD_DOCKER_CREDENTIALS: Keymap<Vec<u8>, AmdDockerCredential> = Keymap::new(AMD_DOCKER_CREDENTIALS_MAP_KEY);
+pub static AMD_DOCKER_CREDENTIALS: Keymap<Vec<u8>, AmdDockerCredential> =
+    Keymap::new(AMD_DOCKER_CREDENTIALS_MAP_KEY);
 
 // =============================================================================
 // AMD STRUCTS

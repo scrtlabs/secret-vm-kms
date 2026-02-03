@@ -8,8 +8,8 @@ use std::backtrace::Backtrace;
 use thiserror::Error;
 use crate::amd_attest::{verify_amd_attestation, AmdAttestationInput, VerifiedAmdReport};
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse, AmdMsgImageFilter, AmdListImageResponse, AmdImageFilterHexEntry};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS, AMD_DOCKER_CREDENTIALS, AmdDockerCredential, AMD_VM_RECORDS, AmdImageFilter, AmdVmRecord, AMD_SERVICES_MAP, AmdFilterEntry, AmdService};
+use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse, AmdMsgImageFilter, AmdListImageResponse, AmdImageFilterHexEntry, HwRegisterPairMsg, HwRegistersWhitelistResponse, HwRegisterPairCheckResponse};
+use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS, AMD_DOCKER_CREDENTIALS, AmdDockerCredential, AMD_VM_RECORDS, AmdImageFilter, AmdVmRecord, AMD_SERVICES_MAP, AmdFilterEntry, AmdService, HW_REGISTERS_WHITELIST, HwRegisterPair};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
@@ -273,6 +273,12 @@ pub fn execute(
         // TEST Handler: Updated to pass certificates
         ExecuteMsg::TestAmdVerification { report, ask_pem, vcek_pem } =>
             try_test_amd_verification(deps, env, info, report, ask_pem, vcek_pem),
+        
+        // --- TDX HW REGISTERS WHITELIST ---
+        ExecuteMsg::AddHwRegistersToWhitelist { pairs } =>
+            try_add_hw_registers_to_whitelist(deps, info, pairs),
+        ExecuteMsg::RemoveHwRegistersFromWhitelist { pairs } =>
+            try_remove_hw_registers_from_whitelist(deps, info, pairs),
     }
 }
 
@@ -310,6 +316,64 @@ fn try_test_amd_verification(
         .add_attribute("status", "success")
         .add_attribute("measurement", measurement_hex)
         .add_attribute("report_data", report_data_hex))
+}
+
+// -----------------------------------------------------------------------------
+// TDX HW REGISTERS WHITELIST HANDLERS
+// -----------------------------------------------------------------------------
+
+/// Add multiple hardware register pairs to whitelist. Only admin can do this.
+fn try_add_hw_registers_to_whitelist(
+    deps: DepsMut,
+    info: MessageInfo,
+    pairs: Vec<HwRegisterPairMsg>,
+) -> StdResult<Response> {
+    // Check if sender is admin
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only admin can modify whitelist"));
+    }
+
+    let mut count = 0;
+    for pair in pairs {
+        let hw_pair = HwRegisterPair {
+            mr_td: pair.mr_td.clone(),
+            rtmr0: pair.rtmr0.clone(),
+        };
+        HW_REGISTERS_WHITELIST.insert(deps.storage, &hw_pair, &true)?;
+        count += 1;
+    }
+
+    Ok(Response::new()
+        .add_attribute("action", "add_hw_registers_to_whitelist")
+        .add_attribute("count", count.to_string()))
+}
+
+/// Remove multiple hardware register pairs from whitelist. Only admin can do this.
+fn try_remove_hw_registers_from_whitelist(
+    deps: DepsMut,
+    info: MessageInfo,
+    pairs: Vec<HwRegisterPairMsg>,
+) -> StdResult<Response> {
+    // Check if sender is admin
+    let gs = global_state_read(deps.storage).load()?;
+    if info.sender != gs.admin {
+        return Err(StdError::generic_err("Only admin can modify whitelist"));
+    }
+
+    let mut count = 0;
+    for pair in pairs {
+        let hw_pair = HwRegisterPair {
+            mr_td: pair.mr_td.clone(),
+            rtmr0: pair.rtmr0.clone(),
+        };
+        HW_REGISTERS_WHITELIST.remove(deps.storage, &hw_pair)?;
+        count += 1;
+    }
+
+    Ok(Response::new()
+        .add_attribute("action", "remove_hw_registers_from_whitelist")
+        .add_attribute("count", count.to_string()))
 }
 
 // -----------------------------------------------------------------------------
@@ -959,7 +1023,7 @@ pub fn try_get_secret_key(
     // match against any service filter
     let mut found = false;
     for entry in svc.filters.iter() {
-        if filter_matches_quote(&entry.filter, &tdx) { found = true; break; }
+        if filter_matches_quote(&entry.filter, &tdx, deps.storage) { found = true; break; }
     }
     if !found { return Err(StdError::generic_err("No matching image filter found")); }
 
@@ -980,7 +1044,7 @@ pub fn try_get_secret_key_by_image(
 
     if let Some(rec) = VM_RECORDS.get(deps.storage, &vm_uid) {
         verify_password_opt(&rec.password_hash, &password)?;
-        if !filter_matches_quote(&rec.filter, &tdx) {
+        if !filter_matches_quote(&rec.filter, &tdx, deps.storage) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
         let secret_hex = rec.secret_key_hex.ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
@@ -1055,6 +1119,12 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
 
         QueryMsg::GetEnvByServiceAmd { service_id, report, ask_pem, vcek_pem, password } =>
             to_binary(&try_get_env_by_service_amd(deps, env, service_id, report, ask_pem, vcek_pem, password)?),
+        
+        // --- TDX HW REGISTERS WHITELIST QUERIES ---
+        QueryMsg::GetAllHwRegisters {} =>
+            to_binary(&query_get_all_hw_registers(deps)?),
+        QueryMsg::CheckHwRegisterPair { mr_td, rtmr0 } =>
+            to_binary(&query_check_hw_register_pair(deps, mr_td, rtmr0)?),
     }
 }
 
@@ -1294,10 +1364,38 @@ fn try_get_env_by_service_amd(
     Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key })
 }
 
+// -----------------------------------------------------------------------------
+// TDX HW REGISTERS WHITELIST QUERY HANDLERS
+// -----------------------------------------------------------------------------
+
+/// Query to get all hardware register pairs from whitelist
+fn query_get_all_hw_registers(deps: Deps) -> StdResult<HwRegistersWhitelistResponse> {
+    let mut pairs = Vec::new();
+    
+    for result in HW_REGISTERS_WHITELIST.iter(deps.storage)? {
+        let (pair, _) = result?;
+        pairs.push(HwRegisterPairMsg {
+            mr_td: pair.mr_td,
+            rtmr0: pair.rtmr0,
+        });
+    }
+    
+    Ok(HwRegistersWhitelistResponse { pairs })
+}
+
+/// Query to check if specific hardware register pair exists in whitelist
+fn query_check_hw_register_pair(deps: Deps, mr_td: String, rtmr0: String) -> StdResult<HwRegisterPairCheckResponse> {
+    let hw_pair = HwRegisterPair { mr_td, rtmr0 };
+    let exists = HW_REGISTERS_WHITELIST.contains(deps.storage, &hw_pair);
+    Ok(HwRegisterPairCheckResponse { exists })
+}
+
 // Helper: filter match vs parsed TDX
-fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t) -> bool {
+// Now checks mr_td and rtmr0 against the whitelist instead of filter
+fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t, storage: &dyn cosmwasm_std::Storage) -> bool {
     let mr_seam = tdx.mr_seam.to_vec();
     let mr_signer = tdx.mr_signer_seam.to_vec();
+    let mr_td = tdx.mr_td.to_vec();
     let mr_config_id = tdx.mr_config_id.to_vec();
     let mr_owner = tdx.mr_owner.to_vec();
     let mr_config = tdx.mr_config.to_vec();
@@ -1308,14 +1406,28 @@ fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t) -> bool {
 
     if let Some(p) = &f.mr_seam        { if p != &mr_seam   { return false; } }
     if let Some(p) = &f.mr_signer_seam { if p != &mr_signer { return false; } }
-    // if let Some(p) = &f.mr_td          { if p != &mr_td     { return false; } }
     if let Some(p) = &f.mr_config_id   { if p != &mr_config_id { return false; } }
     if let Some(p) = &f.mr_owner       { if p != &mr_owner  { return false; } }
     if let Some(p) = &f.mr_config      { if p != &mr_config { return false; } }
-    if let Some(p) = &f.rtmr0          { if p != &rtmr0     { return false; } }
+    // rtmr1, rtmr2, rtmr3 still checked against filter
     if let Some(p) = &f.rtmr1          { if p != &rtmr1     { return false; } }
     if let Some(p) = &f.rtmr2          { if p != &rtmr2     { return false; } }
     if let Some(p) = &f.rtmr3          { if p != &rtmr3     { return false; } }
+    
+    // NEW: Check mr_td and rtmr0 against whitelist instead of filter
+    // Create hex strings for the whitelist check
+    let mr_td_hex = hex::encode(&mr_td);
+    let rtmr0_hex = hex::encode(&rtmr0);
+    let hw_pair = HwRegisterPair {
+        mr_td: mr_td_hex,
+        rtmr0: rtmr0_hex,
+    };
+    
+    // Check if this pair exists in whitelist
+    if !HW_REGISTERS_WHITELIST.contains(storage, &hw_pair) {
+        return false;
+    }
+    
     true
 }
 
@@ -1336,7 +1448,7 @@ pub fn try_get_env_by_service(
 
     let mut found = false;
     for entry in svc.filters.iter() {
-        if filter_matches_quote(&entry.filter, &tdx) { found = true; break; }
+        if filter_matches_quote(&entry.filter, &tdx, deps.storage) { found = true; break; }
     }
     if !found { return Err(StdError::generic_err("No matching image filter found")); }
 
@@ -1456,7 +1568,7 @@ pub fn try_get_env_by_image(
 
     if let Some(rec) = VM_RECORDS.get(deps.storage, &vm_uid) {
         verify_password_opt(&rec.password_hash, &password)?;
-        if !filter_matches_quote(&rec.filter, &tdx) {
+        if !filter_matches_quote(&rec.filter, &tdx, deps.storage) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
         let plain = rec.env_plaintext.ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
@@ -1610,6 +1722,7 @@ mod tests {
         // Add an image filter that specifies mr_td must equal a specific vector of 48 bytes.
         let mut expected_mr_td = vec![0u8;48];
         expected_mr_td[..5].copy_from_slice(&[1,2,3,4,5]);
+        let expected_rtmr0 = vec![0u8;48]; // all zeros
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
@@ -1625,6 +1738,15 @@ mod tests {
         };
         let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter, description: "TestImage".to_string(), timestamp: None };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
+        
+        // Add hardware registers to whitelist
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: hex::encode(&expected_mr_td),
+            rtmr0: hex::encode(&expected_rtmr0),
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
+        
         // Construct a dummy quote buffer of size_of::<tdx_quote_t>()
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
@@ -1644,6 +1766,10 @@ mod tests {
         // mr_td offset = 48 + 16 + 48 + 48 + 8 + 8 + 8 = 184.
         let mr_td_offset = 184;
         quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        // rtmr0 offset = mr_td_offset + 48 + 48 + 48 + 48 = 184 + 192 = 376
+        let rtmr0_offset = 376;
+        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
+        
         // Dummy collateral
         let collateral = vec![0u8; 10];
         let get_msg = QueryMsg::GetSecretKey { service_id: "0".to_string(), quote: quote.clone(), collateral: collateral.clone(), password: None };
@@ -1669,11 +1795,21 @@ mod tests {
         let collateral = hex::decode(collateral_hex.trim())
             .expect("Failed to decode collateral hex");
 
+        // Parse to extract mr_td and rtmr0 for whitelist
+        let tdx = parse_tdx_attestation(&quote, &collateral).expect("Failed to parse attestation");
+        let mr_td_hex = hex::encode(&tdx.mr_td);
+        let rtmr0_hex = hex::encode(&tdx.rtmr0);
+
         // Set up the contract with a service and an image filter that accepts any quote.
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
+
+        // Add hardware registers to whitelist
+        let hw_pair = HwRegisterPairMsg { mr_td: mr_td_hex, rtmr0: rtmr0_hex };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
 
         // Create a new service.
         let create_msg = ExecuteMsg::CreateService { name: "ServiceForFileKey".to_string(), service_id: "0".to_string(), password_hash: None};
@@ -1831,6 +1967,13 @@ mod tests {
         // Extract vm_uid from report_data bytes [32..48]
         let vm_uid = tdx.report_data[32..48].to_vec();
 
+        // Add hardware registers to whitelist
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: hex::encode(&tdx.mr_td),
+            rtmr0: hex::encode(&tdx.rtmr0),
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
 
         let image_filter = MsgImageFilter {
             mr_seam: Some(tdx.mr_seam.to_vec()),
@@ -1973,11 +2116,21 @@ mod tests {
         let admin_info = mock_info("admin", &[]);
         instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
 
+        // Add hardware registers to whitelist
+        let mr_td_bytes = vec![10u8; 48];
+        let rtmr0_bytes = vec![0u8; 48]; // will be all zeros in quote
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: hex::encode(&mr_td_bytes),
+            rtmr0: hex::encode(&rtmr0_bytes),
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
+
         // Add env secret
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
-            mr_td: Some(vec![10u8; 48]),
+            mr_td: Some(mr_td_bytes.clone()),
             mr_config_id: None,
             mr_owner: None,
             mr_config: None,
@@ -2067,6 +2220,15 @@ mod tests {
 
         // --- Step 3. Extract the VM UID from report_data[32..48] ---
         let vm_uid = tdx.report_data[32..48].to_vec();
+
+        // --- Step 3.5. Add hardware registers to whitelist ---
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: hex::encode(&tdx.mr_td),
+            rtmr0: hex::encode(&tdx.rtmr0),
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg)
+            .expect("whitelist should be added");
 
         // --- Step 4. Add the env secret, using the real fields from the quote ---
         let image_filter = MsgImageFilter {
@@ -2325,6 +2487,19 @@ mod tests {
             }
         ).unwrap();
 
+        // Add hardware registers to whitelist (dummy quote has all zeros)
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
+        ).unwrap();
+
         // Build dummy quote
         let quote_len = std::mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len]; quote[0]=4; quote[4]=129;
@@ -2361,6 +2536,20 @@ mod tests {
                 timestamp: None,
             }
         ).unwrap();
+        
+        // Add hardware registers to whitelist
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
+        ).unwrap();
+        
         // Add service env secret
         execute(
             deps.as_mut(), mock_env(), admin.clone(),
@@ -2594,6 +2783,19 @@ mod tests {
                 timestamp: None,
             }
         ).unwrap();
+        
+        // Add hardware registers to whitelist
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
+        ).unwrap();
 
         // Build a minimal valid quote/collateral
         let mut quote = vec![0u8; std::mem::size_of::<tdx_quote_t>()];
@@ -2678,6 +2880,19 @@ mod tests {
                 description: "".into(),
                 timestamp: None,
             }
+        ).unwrap();
+        
+        // Add hardware registers to whitelist
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
         ).unwrap();
 
         // Store env secret at service level
@@ -2767,6 +2982,19 @@ mod tests {
                 password_hash: Some(pwd_hash),
             }
         ).unwrap();
+        
+        // Add hardware registers to whitelist
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
+        ).unwrap();
 
         // 1) No password -> required
         let err = query(
@@ -2833,6 +3061,19 @@ mod tests {
                 secrets_plaintext: "ENV=VM".into(),
                 password_hash: Some(pwd_hash),
             }
+        ).unwrap();
+        
+        // Add hardware registers to whitelist
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: vec![HwRegisterPairMsg {
+                    mr_td: hex::encode(&[0u8; 48]),
+                    rtmr0: hex::encode(&[0u8; 48]),
+                }],
+            },
         ).unwrap();
 
         // 1) No password -> required
@@ -3126,5 +3367,374 @@ mod tests {
 
         let resp: EnvSecretResponse = from_binary(&res).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
+    }
+
+    #[test]
+    fn test_hw_registers_whitelist_add_and_query() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        
+        // Initialize contract
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        // Test data: hardware register pairs
+        let pairs = vec![
+            HwRegisterPairMsg {
+                mr_td: "aabbccdd".to_string(),
+                rtmr0: "11223344".to_string(),
+            },
+            HwRegisterPairMsg {
+                mr_td: "eeff0011".to_string(),
+                rtmr0: "55667788".to_string(),
+            },
+        ];
+
+        // Add pairs to whitelist
+        let add_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: pairs.clone(),
+        };
+        let res = execute(deps.as_mut(), mock_env(), admin.clone(), add_msg).unwrap();
+        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "add_hw_registers_to_whitelist"));
+        assert!(res.attributes.iter().any(|a| a.key == "count" && a.value == "2"));
+
+        // Query all pairs
+        let query_res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetAllHwRegisters {},
+        ).unwrap();
+        let all_pairs: HwRegistersWhitelistResponse = from_binary(&query_res).unwrap();
+        assert_eq!(all_pairs.pairs.len(), 2);
+
+        // Check specific pair exists
+        let check_res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::CheckHwRegisterPair {
+                mr_td: "aabbccdd".to_string(),
+                rtmr0: "11223344".to_string(),
+            },
+        ).unwrap();
+        let check_resp: HwRegisterPairCheckResponse = from_binary(&check_res).unwrap();
+        assert!(check_resp.exists);
+
+        // Check non-existent pair
+        let check_res2 = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::CheckHwRegisterPair {
+                mr_td: "nonexistent".to_string(),
+                rtmr0: "notfound".to_string(),
+            },
+        ).unwrap();
+        let check_resp2: HwRegisterPairCheckResponse = from_binary(&check_res2).unwrap();
+        assert!(!check_resp2.exists);
+    }
+
+    #[test]
+    fn test_hw_registers_whitelist_remove() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        
+        // Initialize contract
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        // Add pairs
+        let pairs = vec![
+            HwRegisterPairMsg {
+                mr_td: "aabbccdd".to_string(),
+                rtmr0: "11223344".to_string(),
+            },
+            HwRegisterPairMsg {
+                mr_td: "eeff0011".to_string(),
+                rtmr0: "55667788".to_string(),
+            },
+        ];
+
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist { pairs: pairs.clone() },
+        ).unwrap();
+
+        // Remove one pair
+        let remove_pairs = vec![pairs[0].clone()];
+        let remove_msg = ExecuteMsg::RemoveHwRegistersFromWhitelist {
+            pairs: remove_pairs,
+        };
+        let res = execute(deps.as_mut(), mock_env(), admin.clone(), remove_msg).unwrap();
+        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "remove_hw_registers_from_whitelist"));
+        assert!(res.attributes.iter().any(|a| a.key == "count" && a.value == "1"));
+
+        // Check that removed pair doesn't exist
+        let check_res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::CheckHwRegisterPair {
+                mr_td: "aabbccdd".to_string(),
+                rtmr0: "11223344".to_string(),
+            },
+        ).unwrap();
+        let check_resp: HwRegisterPairCheckResponse = from_binary(&check_res).unwrap();
+        assert!(!check_resp.exists);
+
+        // Check that other pair still exists
+        let check_res2 = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::CheckHwRegisterPair {
+                mr_td: "eeff0011".to_string(),
+                rtmr0: "55667788".to_string(),
+            },
+        ).unwrap();
+        let check_resp2: HwRegisterPairCheckResponse = from_binary(&check_res2).unwrap();
+        assert!(check_resp2.exists);
+    }
+
+    #[test]
+    fn test_hw_registers_whitelist_only_admin() {
+        let mut deps = mock_dependencies();
+        let admin = mock_info("admin", &[]);
+        let non_admin = mock_info("user", &[]);
+        
+        // Initialize contract
+        instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
+
+        let pairs = vec![
+            HwRegisterPairMsg {
+                mr_td: "aabbccdd".to_string(),
+                rtmr0: "11223344".to_string(),
+            },
+        ];
+
+        // Try to add as non-admin (should fail)
+        let add_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: pairs.clone(),
+        };
+        let res = execute(deps.as_mut(), mock_env(), non_admin.clone(), add_msg);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Only admin"));
+
+        // Add as admin (should succeed)
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddHwRegistersToWhitelist { pairs: pairs.clone() },
+        ).unwrap();
+
+        // Try to remove as non-admin (should fail)
+        let remove_msg = ExecuteMsg::RemoveHwRegistersFromWhitelist {
+            pairs: pairs.clone(),
+        };
+        let res2 = execute(deps.as_mut(), mock_env(), non_admin, remove_msg);
+        assert!(res2.is_err());
+        assert!(res2.unwrap_err().to_string().contains("Only admin"));
+    }
+
+    #[test]
+    fn test_tdx_query_fails_without_whitelist() {
+        // Test that TDX queries fail when mr_td/rtmr0 pair is not in whitelist
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        
+        let create_msg = ExecuteMsg::CreateService { 
+            name: "TestService".to_string(), 
+            service_id: "0".to_string(), 
+            password_hash: None
+        };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
+        
+        let expected_mr_td = vec![7u8; 48];
+        let expected_rtmr0 = vec![9u8; 48];
+        
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(expected_mr_td.clone()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+            vm_uid: None,
+        };
+        let add_msg = ExecuteMsg::AddImageToService { 
+            service_id: "0".to_string(), 
+            image_filter, 
+            description: "TestImage".to_string(), 
+            timestamp: None 
+        };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
+        
+        // Build quote WITHOUT adding to whitelist
+        let quote_len = mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len];
+        quote[0] = 4; quote[1] = 0;
+        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+        
+        let mr_td_offset = 184;
+        quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        let rtmr0_offset = 376;
+        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
+        
+        let collateral = vec![0u8; 10];
+        let get_msg = QueryMsg::GetSecretKey { 
+            service_id: "0".to_string(), 
+            quote: quote.clone(), 
+            collateral: collateral.clone(), 
+            password: None 
+        };
+        
+        // Should fail because pair is not in whitelist
+        let res = query(deps.as_ref(), mock_env(), get_msg);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("No matching image filter"));
+    }
+
+    #[test]
+    fn test_tdx_query_succeeds_with_whitelist() {
+        // Test that TDX queries succeed when mr_td/rtmr0 pair IS in whitelist
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        
+        let create_msg = ExecuteMsg::CreateService { 
+            name: "TestService".to_string(), 
+            service_id: "0".to_string(), 
+            password_hash: None
+        };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
+        
+        let expected_mr_td = vec![7u8; 48];
+        let expected_rtmr0 = vec![9u8; 48];
+        
+        // Add to whitelist
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: hex::encode(&expected_mr_td),
+            rtmr0: hex::encode(&expected_rtmr0),
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
+        
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(expected_mr_td.clone()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+            vm_uid: None,
+        };
+        let add_msg = ExecuteMsg::AddImageToService { 
+            service_id: "0".to_string(), 
+            image_filter, 
+            description: "TestImage".to_string(), 
+            timestamp: None 
+        };
+        execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
+        
+        // Build quote
+        let quote_len = mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len];
+        quote[0] = 4; quote[1] = 0;
+        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+        
+        let mr_td_offset = 184;
+        quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        let rtmr0_offset = 376;
+        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
+        
+        let collateral = vec![0u8; 10];
+        let get_msg = QueryMsg::GetSecretKey { 
+            service_id: "0".to_string(), 
+            quote: quote.clone(), 
+            collateral: collateral.clone(), 
+            password: None 
+        };
+        
+        // Should succeed because pair is in whitelist
+        let res = query(deps.as_ref(), mock_env(), get_msg);
+        assert!(res.is_ok());
+        let secret_key: SecretKeyResponse = from_binary(&res.unwrap()).unwrap();
+        assert!(!secret_key.encrypted_secret_key.is_empty());
+    }
+
+    #[test]
+    fn test_get_env_by_image_fails_without_whitelist() {
+        // Test that GetEnvByImage fails when mr_td/rtmr0 not in whitelist
+        const TEST_VM_UID_HEX: &str = "ffeeddccbbaa99887766554433221100";
+        let vm_uid_bytes = hex::decode(TEST_VM_UID_HEX).unwrap();
+
+        let mut deps = mock_dependencies();
+        let admin_info = mock_info("admin", &[]);
+        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+
+        let mr_td_bytes = vec![99u8; 48];
+        let rtmr0_bytes = vec![88u8; 48];
+        
+        // Add env secret but DON'T add to whitelist
+        let image_filter = MsgImageFilter {
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(mr_td_bytes.clone()),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: Some(vec![20u8; 48]),
+            rtmr2: Some(vec![30u8; 48]),
+            rtmr3: Some(vec![40u8; 48]),
+            vm_uid: Some(vm_uid_bytes.clone()),
+        };
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            ExecuteMsg::AddEnvByImage {
+                image_filter: image_filter.clone(),
+                secrets_plaintext: "secret".to_string(),
+                password_hash: None
+            },
+        ).unwrap();
+
+        // Build quote
+        let quote_len = mem::size_of::<tdx_quote_t>();
+        let mut quote = vec![0u8; quote_len];
+        quote[0] = 4; quote[1] = 0;
+        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+
+        let mr_td_offset = 184;
+        quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&mr_td_bytes);
+        let rtmr0_offset = 376;
+        quote[rtmr0_offset..rtmr0_offset + 48].copy_from_slice(&rtmr0_bytes);
+        let r1_off = 424;
+        quote[r1_off..r1_off + 48].copy_from_slice(&[20u8; 48]);
+        let r2_off = 472;
+        quote[r2_off..r2_off + 48].copy_from_slice(&[30u8; 48]);
+        let r3_off = 520;
+        quote[r3_off..r3_off + 48].copy_from_slice(&[40u8; 48]);
+
+        let rd_off = quote_len - 64;
+        for i in rd_off..(rd_off + 32) { quote[i] = 1; }
+        quote[rd_off + 32..rd_off + 48].copy_from_slice(&vm_uid_bytes);
+
+        let collateral = vec![0u8; 10];
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByImage { quote, collateral, password: None}
+        );
+        
+        // Should fail because not in whitelist
+        assert!(res.is_err());
     }
 }
