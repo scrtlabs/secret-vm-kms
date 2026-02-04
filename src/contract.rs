@@ -1,18 +1,33 @@
-use cosmwasm_std::{entry_point, to_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdResult, StdError, Event, attr, attr_plaintext};
-use sha2::{Digest, Sha256};
-use hex;
 use core::mem;
+use cosmwasm_std::{
+    attr, attr_plaintext, entry_point, to_binary, Binary, Deps, DepsMut, Env, Event, MessageInfo,
+    Response, StdError, StdResult,
+};
+use hex;
+use sha2::{Digest, Sha256};
 #[cfg(feature = "backtraces")]
 use std::backtrace::Backtrace;
 // use sha2::digest::Update;
-use thiserror::Error;
 use crate::amd_attest::{verify_amd_attestation, AmdAttestationInput, VerifiedAmdReport};
 use crate::crypto::{KeyPair, SIVEncryptable, SECRET_KEY_SIZE};
-use crate::msg::{EnvSecretResponse, ExecuteMsg, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg, ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse, DockerCredentialsResponse, AmdMsgImageFilter, AmdListImageResponse, AmdImageFilterHexEntry, HwRegisterPairMsg, HwRegistersWhitelistResponse, HwRegisterPairCheckResponse};
-use crate::state::{global_state, global_state_read, services, services_read, GlobalState, Service, ImageFilter, image_secret_keys, image_secret_keys_read, env_secrets, EnvSecret, env_secrets_read, SERVICES_MAP, FilterEntry, OldService, DockerCredential, docker_credentials, docker_credentials_read, OLD_SERVICES_MAP, OldFilterEntry, VM_RECORDS, VmRecord, DOCKER_CREDENTIALS, AMD_DOCKER_CREDENTIALS, AmdDockerCredential, AMD_VM_RECORDS, AmdImageFilter, AmdVmRecord, AMD_SERVICES_MAP, AmdFilterEntry, AmdService, HW_REGISTERS_WHITELIST, HwRegisterPair};
 use crate::import_helpers::{from_high_half, from_low_half};
 use crate::memory::{build_region, Region};
 use crate::msg::QueryMsg::ListImageFilters;
+use crate::msg::{
+    AmdImageFilterHexEntry, AmdListImageResponse, AmdMsgImageFilter, DockerCredentialsResponse,
+    EnvSecretResponse, ExecuteMsg, HwRegisterPairCheckResponse, HwRegisterPairMsg,
+    HwRegistersWhitelistResponse, ImageFilterHex, ImageFilterHexEntry, InstantiateMsg,
+    ListImageResponse, MigrateMsg, MsgImageFilter, QueryMsg, SecretKeyResponse, ServiceResponse,
+};
+use crate::state::{
+    docker_credentials, docker_credentials_read, env_secrets, env_secrets_read, global_state,
+    global_state_read, image_secret_keys, image_secret_keys_read, services, services_read,
+    AmdDockerCredential, AmdFilterEntry, AmdImageFilter, AmdService, AmdVmRecord, DockerCredential,
+    EnvSecret, FilterEntry, GlobalState, HwRegisterPair, ImageFilter, OldFilterEntry, OldService,
+    Service, VmRecord, AMD_DOCKER_CREDENTIALS, AMD_SERVICES_MAP, AMD_VM_RECORDS,
+    DOCKER_CREDENTIALS, HW_REGISTERS_WHITELIST, OLD_SERVICES_MAP, SERVICES_MAP, VM_RECORDS,
+};
+use thiserror::Error;
 
 // Fixed legacy MR_TD used to derive the legacy image_key (48 bytes).
 // This is ONLY for the legacy fallback path in `try_get_secret_key_by_image`.
@@ -30,29 +45,29 @@ pub struct tdx_quote_hdr_t {
     pub key_type: u16,
     pub tee_type: u32,
     pub reserved: u32,
-    pub qe_vendor_id: [u8;16],
-    pub user_data: [u8;20],
+    pub qe_vendor_id: [u8; 16],
+    pub user_data: [u8; 20],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct tdx_quote_t {
     pub header: tdx_quote_hdr_t,
-    pub tcb_svn: [u8;16],
-    pub mr_seam: [u8;48],
-    pub mr_signer_seam: [u8;48],
-    pub seam_attributes: [u8;8],
-    pub td_attributes: [u8;8],
-    pub xfam: [u8;8],
-    pub mr_td: [u8;48],
-    pub mr_config_id: [u8;48],
-    pub mr_owner: [u8;48],
-    pub mr_config: [u8;48],
-    pub rtmr0: [u8;48],
-    pub rtmr1: [u8;48],
-    pub rtmr2: [u8;48],
-    pub rtmr3: [u8;48],
-    pub report_data: [u8;64],
+    pub tcb_svn: [u8; 16],
+    pub mr_seam: [u8; 48],
+    pub mr_signer_seam: [u8; 48],
+    pub seam_attributes: [u8; 8],
+    pub td_attributes: [u8; 8],
+    pub xfam: [u8; 8],
+    pub mr_td: [u8; 48],
+    pub mr_config_id: [u8; 48],
+    pub mr_owner: [u8; 48],
+    pub mr_config: [u8; 48],
+    pub rtmr0: [u8; 48],
+    pub rtmr1: [u8; 48],
+    pub rtmr2: [u8; 48],
+    pub rtmr3: [u8; 48],
+    pub report_data: [u8; 64],
 }
 
 #[derive(Error, Debug)]
@@ -124,7 +139,7 @@ fn dcap_quote_verify_internal(_quote: &[u8], _collateral: &[u8]) -> Result<u32, 
 
 fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t> {
     match dcap_quote_verify_internal(quote, collateral) {
-        Ok(_qv_result) => {},
+        Ok(_qv_result) => {}
         Err(_) => {
             return None;
         }
@@ -147,43 +162,39 @@ fn parse_tdx_attestation(quote: &[u8], collateral: &[u8]) -> Option<tdx_quote_t>
 pub fn migrate(deps: DepsMut, _env: Env, msg: MigrateMsg) -> StdResult<Response> {
     match msg {
         MigrateMsg::Migrate {} => {
-            // // Phase 1: load all old records into memory to avoid borrow issues
-            // let mut buf: Vec<(String, OldService)> = Vec::new();
-            // for it in OLD_SERVICES_MAP.iter(deps.storage)? {
-            //     let (k, v) = it?;
-            //     buf.push((k, v));
-            // }
-            //
-            // let mut moved: u64 = 0;
-            // let mut replaced: u64 = 0;
-            //
-            // // Phase 2: insert into SERVICES_MAP with password_hash=None
-            // for (key, old) in buf.into_iter() {
-            //     let new_svc = Service {
-            //         id: old.id.clone(),
-            //         name: old.name.clone(),
-            //         admin: old.admin.clone(),
-            //         filters: old.filters.clone(),
-            //         secret_key: old.secret_key.clone(),
-            //         secrets_plaintext: old.secrets_plaintext.clone(),
-            //         password_hash: None, // new field default
-            //     };
-            //
-            //     if SERVICES_MAP.contains(deps.storage, &key) {
-            //         SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
-            //         replaced += 1;
-            //     } else {
-            //         SERVICES_MAP.insert(deps.storage, &key, &new_svc)?;
-            //         moved += 1;
-            //     }
-            //     // remove from OLD map after move
-            //     OLD_SERVICES_MAP.remove(deps.storage, &key)?;
-            // }
+            // Initialize hardware register whitelist with known valid pairs
+            let whitelist_pairs = vec![
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1039e62bcd734341c85d7584bb37781e7a7a2949077b2d909391821ee464b91abd35f8dd2afeec7984f3979a61361f2d"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1d098a879946c2a8d0379ed78989958a432291d8adae8da0472b6dbb0d1eca49d306281f48b55ecd4a90c267c6fe64a8"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "2709012eccc10afb618d90f4e2849de97ede129e27b3f53b4465f71852af9e1a52583e931f340ce9ebfa06be3c3feb48"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "5814602c6329237ab8ab42caba02bb39a4e69723ae19b062429a95f5bec6715217ae66b431e480bc877eb4f3415332b5"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "660eb1c0ce5b816b45ad7d6b49d1e9c2fcd1e14e08ef77faa7b0e9f1d180da593231adae01081799a0c700eb6ab350e7"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e314df50e8cc934afb28ceb6c96987a04ffea8180037f0d8e12b9690c0d6d34131ecacfd752334d70a40aefce572259"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e45e7ad1e74c515a5cf2ba4372465f5670123c34452c339e7fc67418d628401c4a151481e57155500b8d5668ee1c2de"),
+                ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "dcb0a56bede1420cb4e1eb0b6a55d5236a3b46850fb8148007b3c186df333d02ce31b8445137919e3b4752f597e1d37d"),
+                ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "09d747e568e012bb560b37604e25f1a83988037d8286e81bb97e46fb31ec4d35edf9e23236ae573265417e7ed2f89b99"),
+                ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "659f42c47b5a08d18309f1a458c89b230e5a7720ddfd293e2807902781920d28039bc298f3d088fc8e0f894a07d374fc"),
+                ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "671800f0b5fefa5ca79b63bde0ee0e55f38944cedfa69282ac014a9fc5f6a4a19b0cdfe33661012b3390d2aecb8e486a"),
+                ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "8cf0b4047ce95aa84e38049ff7c959b1cc062a50cea4dee141e6cdea8d59c59c78c55a5ad50fef025b7009b68e01fca9"),
+            ];
+
+            let mut added_count = 0;
+            for (mr_td, rtmr0) in whitelist_pairs {
+                let hw_pair = HwRegisterPair {
+                    mr_td: mr_td.to_string(),
+                    rtmr0: rtmr0.to_string(),
+                };
+
+                // Only add if not already present
+                if !HW_REGISTERS_WHITELIST.contains(deps.storage, &hw_pair) {
+                    HW_REGISTERS_WHITELIST.insert(deps.storage, &hw_pair, &true)?;
+                    added_count += 1;
+                }
+            }
 
             Ok(Response::new()
-                .add_attribute("action", "migrate"))
-                // .add_attribute("moved", moved.to_string())
-                // .add_attribute("replaced", replaced.to_string()))
+                .add_attribute("action", "migrate")
+                .add_attribute("hw_registers_added", added_count.to_string()))
         }
         MigrateMsg::StdError {} => Err(StdError::generic_err("this is an std error")),
     }
@@ -212,9 +223,14 @@ pub fn instantiate(
 
 // ---------------- Password helper ----------------
 // If a password_hash is stored, the caller must provide `password` whose SHA256 hex equals the stored hash.
-fn verify_password_opt(stored_hash_hex: &Option<String>, provided_password: &Option<String>) -> StdResult<()> {
+fn verify_password_opt(
+    stored_hash_hex: &Option<String>,
+    provided_password: &Option<String>,
+) -> StdResult<()> {
     if let Some(expected_hex) = stored_hash_hex {
-        let pwd = provided_password.as_ref().ok_or_else(|| StdError::generic_err("Password required"))?;
+        let pwd = provided_password
+            .as_ref()
+            .ok_or_else(|| StdError::generic_err("Password required"))?;
         let mut h = Sha256::new();
         h.update(pwd.as_bytes());
         let got_hex = hex::encode(h.finalize());
@@ -227,58 +243,135 @@ fn verify_password_opt(stored_hash_hex: &Option<String>, provided_password: &Opt
 
 /// Execute entry point for handling ExecuteMsg.
 #[entry_point]
-pub fn execute(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-    msg: ExecuteMsg,
-) -> StdResult<Response> {
+pub fn execute(deps: DepsMut, env: Env, info: MessageInfo, msg: ExecuteMsg) -> StdResult<Response> {
     match msg {
-        ExecuteMsg::CreateService { service_id, name, password_hash } =>
-            try_create_service(deps,env, info, service_id, name, password_hash),
-        ExecuteMsg::AddImageToService { service_id, image_filter, description, timestamp } =>
-            try_add_filter(deps, env, info, service_id, image_filter, description, timestamp),
-        ExecuteMsg::RemoveImageFromService { service_id, image_filter } =>
-            try_remove_filter(deps, info, service_id, image_filter),
-        ExecuteMsg::AddSecretKeyByImage { image_filter, password_hash } => {
-            try_add_secret_key_by_image(deps, env, info, image_filter, password_hash)
-        }
+        ExecuteMsg::CreateService {
+            service_id,
+            name,
+            password_hash,
+        } => try_create_service(deps, env, info, service_id, name, password_hash),
+        ExecuteMsg::AddImageToService {
+            service_id,
+            image_filter,
+            description,
+            timestamp,
+        } => try_add_filter(
+            deps,
+            env,
+            info,
+            service_id,
+            image_filter,
+            description,
+            timestamp,
+        ),
+        ExecuteMsg::RemoveImageFromService {
+            service_id,
+            image_filter,
+        } => try_remove_filter(deps, info, service_id, image_filter),
+        ExecuteMsg::AddSecretKeyByImage {
+            image_filter,
+            password_hash,
+        } => try_add_secret_key_by_image(deps, env, info, image_filter, password_hash),
         // NEW: New operation to add or update an env secret by image.
-        ExecuteMsg::AddEnvByImage { image_filter, secrets_plaintext, password_hash } => {
-            try_add_env_by_image(deps, env, info, image_filter, secrets_plaintext, password_hash)
-        }
-        ExecuteMsg::AddDockerCredentialsByImage { image_filter, username, password_plaintext } => {
-            try_add_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext)
-        }
-        ExecuteMsg::AddEnvByService { service_id, secrets_plaintext } =>
-            try_add_env_by_service(deps, env, info, service_id, secrets_plaintext),
+        ExecuteMsg::AddEnvByImage {
+            image_filter,
+            secrets_plaintext,
+            password_hash,
+        } => try_add_env_by_image(
+            deps,
+            env,
+            info,
+            image_filter,
+            secrets_plaintext,
+            password_hash,
+        ),
+        ExecuteMsg::AddDockerCredentialsByImage {
+            image_filter,
+            username,
+            password_plaintext,
+        } => try_add_docker_credentials_by_image(
+            deps,
+            env,
+            info,
+            image_filter,
+            username,
+            password_plaintext,
+        ),
+        ExecuteMsg::AddEnvByService {
+            service_id,
+            secrets_plaintext,
+        } => try_add_env_by_service(deps, env, info, service_id, secrets_plaintext),
         // --- AMD Handlers (New) ---
-        ExecuteMsg::CreateAmdService { service_id, name, password_hash } =>
-            try_create_amd_service(deps, env, info, service_id, name, password_hash),
+        ExecuteMsg::CreateAmdService {
+            service_id,
+            name,
+            password_hash,
+        } => try_create_amd_service(deps, env, info, service_id, name, password_hash),
 
-        ExecuteMsg::AddAmdImageToService { service_id, image_filter, description, timestamp } =>
-            try_add_amd_filter(deps, env, info, service_id, image_filter, description, timestamp),
+        ExecuteMsg::AddAmdImageToService {
+            service_id,
+            image_filter,
+            description,
+            timestamp,
+        } => try_add_amd_filter(
+            deps,
+            env,
+            info,
+            service_id,
+            image_filter,
+            description,
+            timestamp,
+        ),
 
-        ExecuteMsg::AddAmdEnvByService { service_id, secrets_plaintext } =>
-            try_add_amd_env_by_service(deps, env, info, service_id, secrets_plaintext),
+        ExecuteMsg::AddAmdEnvByService {
+            service_id,
+            secrets_plaintext,
+        } => try_add_amd_env_by_service(deps, env, info, service_id, secrets_plaintext),
 
-        ExecuteMsg::AddAmdSecretKeyByImage { image_filter, password_hash } =>
-            try_add_amd_secret_key_by_image(deps, env, info, image_filter, password_hash),
+        ExecuteMsg::AddAmdSecretKeyByImage {
+            image_filter,
+            password_hash,
+        } => try_add_amd_secret_key_by_image(deps, env, info, image_filter, password_hash),
 
-        ExecuteMsg::AddAmdEnvByImage { image_filter, secrets_plaintext, password_hash } =>
-            try_add_amd_env_by_image(deps, env, info, image_filter, secrets_plaintext, password_hash),
+        ExecuteMsg::AddAmdEnvByImage {
+            image_filter,
+            secrets_plaintext,
+            password_hash,
+        } => try_add_amd_env_by_image(
+            deps,
+            env,
+            info,
+            image_filter,
+            secrets_plaintext,
+            password_hash,
+        ),
 
-        ExecuteMsg::AddAmdDockerCredentialsByImage { image_filter, username, password_plaintext } =>
-            try_add_amd_docker_credentials_by_image(deps, env, info, image_filter, username, password_plaintext),
+        ExecuteMsg::AddAmdDockerCredentialsByImage {
+            image_filter,
+            username,
+            password_plaintext,
+        } => try_add_amd_docker_credentials_by_image(
+            deps,
+            env,
+            info,
+            image_filter,
+            username,
+            password_plaintext,
+        ),
         // TEST Handler: Updated to pass certificates
-        ExecuteMsg::TestAmdVerification { report, ask_pem, vcek_pem } =>
-            try_test_amd_verification(deps, env, info, report, ask_pem, vcek_pem),
-        
+        ExecuteMsg::TestAmdVerification {
+            report,
+            ask_pem,
+            vcek_pem,
+        } => try_test_amd_verification(deps, env, info, report, ask_pem, vcek_pem),
+
         // --- TDX HW REGISTERS WHITELIST ---
-        ExecuteMsg::AddHwRegistersToWhitelist { pairs } =>
-            try_add_hw_registers_to_whitelist(deps, info, pairs),
-        ExecuteMsg::RemoveHwRegistersFromWhitelist { pairs } =>
-            try_remove_hw_registers_from_whitelist(deps, info, pairs),
+        ExecuteMsg::AddHwRegistersToWhitelist { pairs } => {
+            try_add_hw_registers_to_whitelist(deps, info, pairs)
+        }
+        ExecuteMsg::RemoveHwRegistersFromWhitelist { pairs } => {
+            try_remove_hw_registers_from_whitelist(deps, info, pairs)
+        }
     }
 }
 
@@ -294,7 +387,6 @@ fn try_test_amd_verification(
     ask_pem: String,
     vcek_pem: String,
 ) -> StdResult<Response> {
-
     // 1. Construct the verification input
     let att = AmdAttestationInput {
         report_b64,
@@ -417,9 +509,9 @@ fn try_create_amd_service(
     AMD_SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
 
     Ok(Response::new()
-        .add_attribute("action","create_amd_service")
-        .add_attribute("service_id",service_id)
-        .add_attribute("name",name))
+        .add_attribute("action", "create_amd_service")
+        .add_attribute("service_id", service_id)
+        .add_attribute("name", name))
 }
 
 /// Add Env secret to AMD Service.
@@ -435,7 +527,9 @@ fn try_add_amd_env_by_service(
         .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
 
     if info.sender.to_string() != svc.admin {
-        return Err(StdError::generic_err("Only the service admin can add service env secret"));
+        return Err(StdError::generic_err(
+            "Only the service admin can add service env secret",
+        ));
     }
 
     svc.secrets_plaintext = Some(secrets_plaintext);
@@ -462,7 +556,9 @@ fn try_add_amd_filter(
         .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
 
     if info.sender.to_string() != svc.admin {
-        return Err(StdError::generic_err("Only the service admin can add image filter"));
+        return Err(StdError::generic_err(
+            "Only the service admin can add image filter",
+        ));
     }
 
     let entry_filter = AmdImageFilter {
@@ -494,32 +590,51 @@ fn try_add_amd_secret_key_by_image(
 ) -> StdResult<Response> {
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
-        return Err(StdError::generic_err("Only the admin can add a VM secret key"));
+        return Err(StdError::generic_err(
+            "Only the admin can add a VM secret key",
+        ));
     }
-    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let vm_uid = image_filter
+        .vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
     // Derive key
     let mut key_hasher = Sha256::new();
-    for bin in env.block.random.iter() { key_hasher.update(bin.as_slice()); }
-    if let Some(v) = &image_filter.measurement { key_hasher.update(v); }
+    for bin in env.block.random.iter() {
+        key_hasher.update(bin.as_slice());
+    }
+    if let Some(v) = &image_filter.measurement {
+        key_hasher.update(v);
+    }
     key_hasher.update(&vm_uid);
     let secret_hex = hex::encode(key_hasher.finalize());
 
-    let f = AmdImageFilter { measurement: image_filter.measurement };
+    let f = AmdImageFilter {
+        measurement: image_filter.measurement,
+    };
 
     let mut updated = false;
     let rec = if let Some(mut r) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
         r.filter = f;
         r.secret_key_hex = Some(secret_hex);
-        if password_hash.is_some() { r.password_hash = password_hash; }
+        if password_hash.is_some() {
+            r.password_hash = password_hash;
+        }
         updated = true;
         r
     } else {
-        AmdVmRecord { filter: f, secret_key_hex: Some(secret_hex), env_plaintext: None, password_hash }
+        AmdVmRecord {
+            filter: f,
+            secret_key_hex: Some(secret_hex),
+            env_plaintext: None,
+            password_hash,
+        }
     };
 
     AMD_VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
-    Ok(Response::new().add_attribute("action","add_amd_secret_key_by_image").add_attribute("updated", updated.to_string()))
+    Ok(Response::new()
+        .add_attribute("action", "add_amd_secret_key_by_image")
+        .add_attribute("updated", updated.to_string()))
 }
 
 /// Add Env by Image (VM-based) for AMD.
@@ -535,23 +650,36 @@ fn try_add_amd_env_by_image(
     if info.sender != gs.admin {
         return Err(StdError::generic_err("Only the admin can add env for VM"));
     }
-    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let vm_uid = image_filter
+        .vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
-    let f = AmdImageFilter { measurement: image_filter.measurement };
+    let f = AmdImageFilter {
+        measurement: image_filter.measurement,
+    };
 
     let mut updated = false;
     let rec = if let Some(mut r) = AMD_VM_RECORDS.get(deps.storage, &vm_uid) {
         r.filter = f;
         r.env_plaintext = Some(secrets_plaintext);
-        if password_hash.is_some() { r.password_hash = password_hash; }
+        if password_hash.is_some() {
+            r.password_hash = password_hash;
+        }
         updated = true;
         r
     } else {
-        AmdVmRecord { filter: f, secret_key_hex: None, env_plaintext: Some(secrets_plaintext), password_hash }
+        AmdVmRecord {
+            filter: f,
+            secret_key_hex: None,
+            env_plaintext: Some(secrets_plaintext),
+            password_hash,
+        }
     };
 
     AMD_VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
-    Ok(Response::new().add_attribute("action","add_amd_env_by_image").add_attribute("updated", updated.to_string()))
+    Ok(Response::new()
+        .add_attribute("action", "add_amd_env_by_image")
+        .add_attribute("updated", updated.to_string()))
 }
 
 /// Add Docker Creds (VM-based) for AMD.
@@ -565,11 +693,17 @@ fn try_add_amd_docker_credentials_by_image(
 ) -> StdResult<Response> {
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
-        return Err(StdError::generic_err("Only the admin can add docker credentials"));
+        return Err(StdError::generic_err(
+            "Only the admin can add docker credentials",
+        ));
     }
 
-    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
-    let measurement = image_filter.measurement.ok_or_else(|| StdError::generic_err("measurement required"))?;
+    let vm_uid = image_filter
+        .vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let measurement = image_filter
+        .measurement
+        .ok_or_else(|| StdError::generic_err("measurement required"))?;
 
     let new_rec = AmdDockerCredential {
         measurement: measurement.clone(),
@@ -608,7 +742,9 @@ pub fn try_add_env_by_service(
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
     let gs = global_state_read(deps.storage).load()?;
     if info.sender.to_string() != svc.admin {
-        return Err(StdError::generic_err("Only the service admin can add service env secret"));
+        return Err(StdError::generic_err(
+            "Only the service admin can add service env secret",
+        ));
     }
     // store or update secret
     svc.secrets_plaintext = Some(secrets_plaintext.clone());
@@ -630,7 +766,9 @@ pub fn try_add_docker_credentials_by_image(
     // Only global admin can add docker credentials
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
-        return Err(StdError::generic_err("Only the admin can add docker credentials"));
+        return Err(StdError::generic_err(
+            "Only the admin can add docker credentials",
+        ));
     }
 
     // vm_uid is REQUIRED (we store by vm_uid)
@@ -697,28 +835,45 @@ pub fn try_add_env_by_image(
     if info.sender != gs.admin {
         return Err(StdError::generic_err("Only the admin can add env for VM"));
     }
-    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let vm_uid = image_filter
+        .vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
     let f = ImageFilter {
-        mr_seam: image_filter.mr_seam, mr_signer_seam: image_filter.mr_signer_seam,
-        mr_td: image_filter.mr_td, mr_config_id: image_filter.mr_config_id, mr_owner: image_filter.mr_owner,
-        mr_config: image_filter.mr_config, rtmr0: image_filter.rtmr0, rtmr1: image_filter.rtmr1,
-        rtmr2: image_filter.rtmr2, rtmr3: image_filter.rtmr3,
+        mr_seam: image_filter.mr_seam,
+        mr_signer_seam: image_filter.mr_signer_seam,
+        mr_td: image_filter.mr_td,
+        mr_config_id: image_filter.mr_config_id,
+        mr_owner: image_filter.mr_owner,
+        mr_config: image_filter.mr_config,
+        rtmr0: image_filter.rtmr0,
+        rtmr1: image_filter.rtmr1,
+        rtmr2: image_filter.rtmr2,
+        rtmr3: image_filter.rtmr3,
     };
 
     let mut updated = false;
     let rec = if let Some(mut r) = VM_RECORDS.get(deps.storage, &vm_uid) {
         r.filter = f;
         r.env_plaintext = Some(secrets_plaintext);
-        if password_hash.is_some() { r.password_hash = password_hash; }
+        if password_hash.is_some() {
+            r.password_hash = password_hash;
+        }
         updated = true;
         r
     } else {
-        VmRecord { filter: f, secret_key_hex: None, env_plaintext: Some(secrets_plaintext), password_hash }
+        VmRecord {
+            filter: f,
+            secret_key_hex: None,
+            env_plaintext: Some(secrets_plaintext),
+            password_hash,
+        }
     };
 
     VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
-    Ok(Response::new().add_attribute("action","add_env_by_image").add_attribute("updated", updated.to_string()))
+    Ok(Response::new()
+        .add_attribute("action", "add_env_by_image")
+        .add_attribute("updated", updated.to_string()))
 }
 
 // Unified VM: Add secret key under VM_RECORDS (keyed by vm_uid)
@@ -731,40 +886,69 @@ fn try_add_secret_key_by_image(
 ) -> StdResult<Response> {
     let gs = global_state_read(deps.storage).load()?;
     if info.sender != gs.admin {
-        return Err(StdError::generic_err("Only the admin can add a VM secret key"));
+        return Err(StdError::generic_err(
+            "Only the admin can add a VM secret key",
+        ));
     }
-    let vm_uid = image_filter.vm_uid.ok_or_else(|| StdError::generic_err("vm_uid required"))?;
+    let vm_uid = image_filter
+        .vm_uid
+        .ok_or_else(|| StdError::generic_err("vm_uid required"))?;
 
     // Derive deterministic secret hex using randomness + key fields
     let mut key_hasher = Sha256::new();
-    for bin in env.block.random.iter() { key_hasher.update(bin.as_slice()); }
-    if let Some(v) = &image_filter.mr_td   { key_hasher.update(v); }
-    if let Some(v) = &image_filter.rtmr1   { key_hasher.update(v); }
-    if let Some(v) = &image_filter.rtmr2   { key_hasher.update(v); }
-    if let Some(v) = &image_filter.rtmr3   { key_hasher.update(v); }
+    for bin in env.block.random.iter() {
+        key_hasher.update(bin.as_slice());
+    }
+    if let Some(v) = &image_filter.mr_td {
+        key_hasher.update(v);
+    }
+    if let Some(v) = &image_filter.rtmr1 {
+        key_hasher.update(v);
+    }
+    if let Some(v) = &image_filter.rtmr2 {
+        key_hasher.update(v);
+    }
+    if let Some(v) = &image_filter.rtmr3 {
+        key_hasher.update(v);
+    }
     key_hasher.update(&vm_uid);
     let secret_hex = hex::encode(key_hasher.finalize());
 
     let f = ImageFilter {
-        mr_seam: image_filter.mr_seam, mr_signer_seam: image_filter.mr_signer_seam,
-        mr_td: image_filter.mr_td, mr_config_id: image_filter.mr_config_id, mr_owner: image_filter.mr_owner,
-        mr_config: image_filter.mr_config, rtmr0: image_filter.rtmr0, rtmr1: image_filter.rtmr1,
-        rtmr2: image_filter.rtmr2, rtmr3: image_filter.rtmr3,
+        mr_seam: image_filter.mr_seam,
+        mr_signer_seam: image_filter.mr_signer_seam,
+        mr_td: image_filter.mr_td,
+        mr_config_id: image_filter.mr_config_id,
+        mr_owner: image_filter.mr_owner,
+        mr_config: image_filter.mr_config,
+        rtmr0: image_filter.rtmr0,
+        rtmr1: image_filter.rtmr1,
+        rtmr2: image_filter.rtmr2,
+        rtmr3: image_filter.rtmr3,
     };
 
     let mut updated = false;
     let rec = if let Some(mut r) = VM_RECORDS.get(deps.storage, &vm_uid) {
         r.filter = f;
         r.secret_key_hex = Some(secret_hex);
-        if password_hash.is_some() { r.password_hash = password_hash; }
+        if password_hash.is_some() {
+            r.password_hash = password_hash;
+        }
         updated = true;
         r
     } else {
-        VmRecord { filter: f, secret_key_hex: Some(secret_hex), env_plaintext: None, password_hash }
+        VmRecord {
+            filter: f,
+            secret_key_hex: Some(secret_hex),
+            env_plaintext: None,
+            password_hash,
+        }
     };
 
     VM_RECORDS.insert(deps.storage, &vm_uid, &rec)?;
-    Ok(Response::new().add_attribute("action","add_secret_key_by_image_vm").add_attribute("updated", updated.to_string()))
+    Ok(Response::new()
+        .add_attribute("action", "add_secret_key_by_image_vm")
+        .add_attribute("updated", updated.to_string()))
 }
 
 /// Create service: generate secret_key via SHA256(env.random + id)
@@ -791,9 +975,20 @@ fn try_create_service(
     sha2::Digest::update(&mut hasher, service_id.as_bytes());
     let secret_key = hasher.finalize().to_vec();
     // The sender becomes the service admin
-    let svc = Service { id: service_id.clone(), name: name.clone(), admin: info.sender.clone(), secret_key, filters: Vec::new(), secrets_plaintext: None, password_hash,};
+    let svc = Service {
+        id: service_id.clone(),
+        name: name.clone(),
+        admin: info.sender.clone(),
+        secret_key,
+        filters: Vec::new(),
+        secrets_plaintext: None,
+        password_hash,
+    };
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
-    Ok(Response::new().add_attribute("action","create_service").add_attribute("service_id",service_id).add_attribute("name",name))
+    Ok(Response::new()
+        .add_attribute("action", "create_service")
+        .add_attribute("service_id", service_id)
+        .add_attribute("name", name))
 }
 
 /// Add filter
@@ -812,7 +1007,9 @@ fn try_add_filter(
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
     // Only admin may add
     if info.sender.to_string() != svc.admin {
-        return Err(StdError::generic_err("Only the service admin can add image filter"));
+        return Err(StdError::generic_err(
+            "Only the service admin can add image filter",
+        ));
     }
     // Convert MsgImageFilter to state::ImageFilter
     let entry_filter = ImageFilter {
@@ -835,7 +1032,11 @@ fn try_add_filter(
     let ts_to_store = timestamp.or(Some(env.block.time.seconds()));
 
     // Add new filter entry
-    svc.filters.push(FilterEntry { filter: entry_filter.clone(), description: description.clone() ,timestamp: ts_to_store,  });
+    svc.filters.push(FilterEntry {
+        filter: entry_filter.clone(),
+        description: description.clone(),
+        timestamp: ts_to_store,
+    });
     // Persist updated service
     SERVICES_MAP.insert(deps.storage, &service_id, &svc)?;
     // Prepare a JSON string of the filter for the event
@@ -913,9 +1114,8 @@ fn try_remove_filter(
             Event::new("remove_image_from_service")
                 .add_attribute_plaintext("service_id", service_id.clone())
                 .add_attribute_plaintext("admin", info.sender.to_string())
-                .add_attribute_plaintext("filter", filter_str)
-        )
-    )
+                .add_attribute_plaintext("filter", filter_str),
+        ))
 }
 
 /// New helper function to encrypt the secret key using AES-SIV.
@@ -956,7 +1156,6 @@ fn encrypt_secret(
         encryption_pub_key: hex::encode(kp.get_pubkey()),
     })
 }
-
 
 fn encrypt_docker_credentials(
     username_plaintext: String,
@@ -999,7 +1198,6 @@ fn encrypt_docker_credentials(
     })
 }
 
-
 /// Handles obtaining the secret key for a service.
 /// It receives two buffers (quote and collateral), parses the TDX attestation using the provided function,
 /// then iterates over stored image filters. For each filter, for every field that is Some,
@@ -1014,7 +1212,9 @@ pub fn try_get_secret_key(
     collateral: Vec<u8>,
     password: Option<String>,
 ) -> StdResult<SecretKeyResponse> {
-    let svc = SERVICES_MAP.get(deps.storage, &service_id).ok_or_else(|| StdError::generic_err("Service not found"))?;
+    let svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
     verify_password_opt(&svc.password_hash, &password)?;
 
     let tdx = parse_tdx_attestation(&quote, &collateral)
@@ -1023,12 +1223,24 @@ pub fn try_get_secret_key(
     // match against any service filter
     let mut found = false;
     for entry in svc.filters.iter() {
-        if filter_matches_quote(&entry.filter, &tdx, deps.storage) { found = true; break; }
+        if filter_matches_quote(&entry.filter, &tdx, deps.storage) {
+            found = true;
+            break;
+        }
     }
-    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
+    }
 
-    let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Invalid report_data"))?;
-    encrypt_secret(svc.secret_key.clone(), other_pub, &quote, env.block.height.to_string().into_bytes())
+    let other_pub: [u8; 32] = tdx.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Invalid report_data"))?;
+    encrypt_secret(
+        svc.secret_key.clone(),
+        other_pub,
+        &quote,
+        env.block.height.to_string().into_bytes(),
+    )
 }
 
 pub fn try_get_secret_key_by_image(
@@ -1047,10 +1259,20 @@ pub fn try_get_secret_key_by_image(
         if !filter_matches_quote(&rec.filter, &tdx, deps.storage) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
-        let secret_hex = rec.secret_key_hex.ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
-        let secret_bytes = hex::decode(secret_hex).map_err(|_| StdError::generic_err("Stored secret malformed"))?;
-        let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
-        return encrypt_secret(secret_bytes, other_pub, &quote, env.block.height.to_string().into_bytes());
+        let secret_hex = rec
+            .secret_key_hex
+            .ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
+        let secret_bytes = hex::decode(secret_hex)
+            .map_err(|_| StdError::generic_err("Stored secret malformed"))?;
+        let other_pub: [u8; 32] = tdx.report_data[0..32]
+            .try_into()
+            .map_err(|_| StdError::generic_err("Bad report_data"))?;
+        return encrypt_secret(
+            secret_bytes,
+            other_pub,
+            &quote,
+            env.block.height.to_string().into_bytes(),
+        );
     }
 
     // Legacy fallback by image hash (no password for legacy)
@@ -1065,13 +1287,21 @@ pub fn try_get_secret_key_by_image(
     let image_key = hasher.finalize().to_vec();
 
     let bucket = image_secret_keys_read(deps.storage);
-    let secret_hex = bucket.load(&image_key)
+    let secret_hex = bucket
+        .load(&image_key)
         .map_err(|_| StdError::generic_err("Secret key for this image has not been created"))?;
-    let secret_bytes = hex::decode(&secret_hex).map_err(|_| StdError::generic_err("Stored secret is malformed"))?;
-    let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
-    encrypt_secret(secret_bytes, other_pub, &quote, env.block.height.to_string().into_bytes())
+    let secret_bytes = hex::decode(&secret_hex)
+        .map_err(|_| StdError::generic_err("Stored secret is malformed"))?;
+    let other_pub: [u8; 32] = tdx.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    encrypt_secret(
+        secret_bytes,
+        other_pub,
+        &quote,
+        env.block.height.to_string().into_bytes(),
+    )
 }
-
 
 /// Query entry point for handling QueryMsg.
 #[entry_point]
@@ -1079,52 +1309,107 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::GetService { id } => to_binary(&query_service(deps, id)?),
         QueryMsg::ListServices {} => to_binary(&query_services(deps)?),
-        QueryMsg::GetSecretKey { service_id, quote, collateral, password } => {
-            to_binary(&try_get_secret_key(deps, env.clone(), service_id, quote, collateral, password)?)
-        }
-        QueryMsg::GetSecretKeyByImage { quote, collateral, password } => {
-            to_binary(&try_get_secret_key_by_image(deps, env, quote, collateral, password)?)
-        }
+        QueryMsg::GetSecretKey {
+            service_id,
+            quote,
+            collateral,
+            password,
+        } => to_binary(&try_get_secret_key(
+            deps,
+            env.clone(),
+            service_id,
+            quote,
+            collateral,
+            password,
+        )?),
+        QueryMsg::GetSecretKeyByImage {
+            quote,
+            collateral,
+            password,
+        } => to_binary(&try_get_secret_key_by_image(
+            deps, env, quote, collateral, password,
+        )?),
         // NEW: Operation to retrieve env secret by image.
-        QueryMsg::GetEnvByImage { quote, collateral,password  } => {
-            to_binary(&try_get_env_by_image(deps, env, quote, collateral,password)?)
-        }
-        QueryMsg::GetDockerCredentialsByImage { quote, collateral } => {
-            to_binary(&try_get_docker_credentials_by_image(deps, env, quote, collateral)?)
-        }
+        QueryMsg::GetEnvByImage {
+            quote,
+            collateral,
+            password,
+        } => to_binary(&try_get_env_by_image(
+            deps, env, quote, collateral, password,
+        )?),
+        QueryMsg::GetDockerCredentialsByImage { quote, collateral } => to_binary(
+            &try_get_docker_credentials_by_image(deps, env, quote, collateral)?,
+        ),
         /// Return filters (with descriptions) for a service
-        ListImageFilters { service_id} =>  {
-            to_binary(&query_image_filters(deps, service_id)?)
-        }
-        QueryMsg::GetEnvByService { service_id, quote, collateral, password } =>
-            to_binary(&try_get_env_by_service(deps, env, service_id, quote, collateral, password)?),
+        ListImageFilters { service_id } => to_binary(&query_image_filters(deps, service_id)?),
+        QueryMsg::GetEnvByService {
+            service_id,
+            quote,
+            collateral,
+            password,
+        } => to_binary(&try_get_env_by_service(
+            deps, env, service_id, quote, collateral, password,
+        )?),
 
         // --- AMD Queries (Strictly AMD Maps) ---
         QueryMsg::GetAmdService { id } => to_binary(&query_amd_service(deps, id)?),
         QueryMsg::ListAmdServices {} => to_binary(&query_amd_services(deps)?),
-        QueryMsg::ListAmdImageFilters { service_id } => to_binary(&query_amd_image_filters(deps, service_id)?),
+        QueryMsg::ListAmdImageFilters { service_id } => {
+            to_binary(&query_amd_image_filters(deps, service_id)?)
+        }
 
         // Updated signatures requiring PEMs
-        QueryMsg::GetSecretKeyAmd { service_id, report, ask_pem, vcek_pem, password } =>
-            to_binary(&try_get_secret_key_amd(deps, env, service_id, report, ask_pem, vcek_pem, password)?),
+        QueryMsg::GetSecretKeyAmd {
+            service_id,
+            report,
+            ask_pem,
+            vcek_pem,
+            password,
+        } => to_binary(&try_get_secret_key_amd(
+            deps, env, service_id, report, ask_pem, vcek_pem, password,
+        )?),
 
-        QueryMsg::GetSecretKeyByImageAmd { report, ask_pem, vcek_pem, password } =>
-            to_binary(&try_get_secret_key_by_image_amd(deps, env, report, ask_pem, vcek_pem, password)?),
+        QueryMsg::GetSecretKeyByImageAmd {
+            report,
+            ask_pem,
+            vcek_pem,
+            password,
+        } => to_binary(&try_get_secret_key_by_image_amd(
+            deps, env, report, ask_pem, vcek_pem, password,
+        )?),
 
-        QueryMsg::GetEnvByImageAmd { report, ask_pem, vcek_pem, password } =>
-            to_binary(&try_get_env_by_image_amd(deps, env, report, ask_pem, vcek_pem, password)?),
+        QueryMsg::GetEnvByImageAmd {
+            report,
+            ask_pem,
+            vcek_pem,
+            password,
+        } => to_binary(&try_get_env_by_image_amd(
+            deps, env, report, ask_pem, vcek_pem, password,
+        )?),
 
-        QueryMsg::GetDockerCredentialsByImageAmd { report, ask_pem, vcek_pem } =>
-            to_binary(&try_get_docker_credentials_by_image_amd(deps, env, report, ask_pem, vcek_pem)?),
+        QueryMsg::GetDockerCredentialsByImageAmd {
+            report,
+            ask_pem,
+            vcek_pem,
+        } => to_binary(&try_get_docker_credentials_by_image_amd(
+            deps, env, report, ask_pem, vcek_pem,
+        )?),
 
-        QueryMsg::GetEnvByServiceAmd { service_id, report, ask_pem, vcek_pem, password } =>
-            to_binary(&try_get_env_by_service_amd(deps, env, service_id, report, ask_pem, vcek_pem, password)?),
-        
+        QueryMsg::GetEnvByServiceAmd {
+            service_id,
+            report,
+            ask_pem,
+            vcek_pem,
+            password,
+        } => to_binary(&try_get_env_by_service_amd(
+            deps, env, service_id, report, ask_pem, vcek_pem, password,
+        )?),
+
         // --- TDX HW REGISTERS WHITELIST QUERIES ---
-        QueryMsg::GetAllHwRegisters {} =>
-            to_binary(&query_get_all_hw_registers(deps)?),
-        QueryMsg::CheckHwRegisterPair { mr_td, rtmr0 } =>
-            to_binary(&query_check_hw_register_pair(deps, mr_td, rtmr0)?),
+        QueryMsg::GetAllHwRegisters {} => to_binary(&query_get_all_hw_registers(deps)?),
+        QueryMsg::CheckHwRegisterPair { mr_td, rtmr0 } => {
+            to_binary(&query_check_hw_register_pair(deps, mr_td, rtmr0)?)
+        }
     }
 }
 
@@ -1134,7 +1419,11 @@ fn query_amd_service(deps: Deps, id: String) -> StdResult<ServiceResponse> {
     let svc = AMD_SERVICES_MAP
         .get(deps.storage, &id)
         .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
-    Ok(ServiceResponse { id: svc.id, name: svc.name, admin: svc.admin.into_string() })
+    Ok(ServiceResponse {
+        id: svc.id,
+        name: svc.name,
+        admin: svc.admin.into_string(),
+    })
 }
 
 fn query_amd_services(deps: Deps) -> StdResult<Vec<ServiceResponse>> {
@@ -1155,16 +1444,23 @@ fn query_amd_image_filters(deps: Deps, service_id: String) -> StdResult<AmdListI
         .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
 
-    let list = svc.filters.iter().map(|entry| {
-        let f = &entry.filter;
-        AmdImageFilterHexEntry {
-            measurement: f.measurement.as_ref().map(|b| hex::encode(b)),
-            description: entry.description.clone(),
-            timestamp: entry.timestamp,
-        }
-    }).collect();
+    let list = svc
+        .filters
+        .iter()
+        .map(|entry| {
+            let f = &entry.filter;
+            AmdImageFilterHexEntry {
+                measurement: f.measurement.as_ref().map(|b| hex::encode(b)),
+                description: entry.description.clone(),
+                timestamp: entry.timestamp,
+            }
+        })
+        .collect();
 
-    Ok(AmdListImageResponse { service_id, filters: list })
+    Ok(AmdListImageResponse {
+        service_id,
+        filters: list,
+    })
 }
 
 // --- AMD Verification Logic ---
@@ -1197,21 +1493,33 @@ fn try_get_secret_key_amd(
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
-    let svc = AMD_SERVICES_MAP.get(deps.storage, &service_id)
+    let svc = AMD_SERVICES_MAP
+        .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found in AMD map"))?;
 
     verify_password_opt(&svc.password_hash, &password)?;
 
     let mut found = false;
     for entry in svc.filters.iter() {
-        if amd_filter_matches(&entry.filter, &verified) { found = true; break; }
+        if amd_filter_matches(&entry.filter, &verified) {
+            found = true;
+            break;
+        }
     }
-    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
+    }
 
-    let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
-    let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+    let other_pub: [u8; 32] = verified.report_data[0..32].try_into().unwrap();
+    let report_bytes =
+        base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
 
-    encrypt_secret(svc.secret_key.clone(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())
+    encrypt_secret(
+        svc.secret_key.clone(),
+        other_pub,
+        &report_bytes,
+        env.block.height.to_string().into_bytes(),
+    )
 }
 
 // 2. Get Secret Key By Image (AMD)
@@ -1238,16 +1546,27 @@ fn try_get_secret_key_by_image_amd(
         if !amd_filter_matches(&rec.filter, &verified) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
-        let secret_hex = rec.secret_key_hex.ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
-        let secret_bytes = hex::decode(secret_hex).map_err(|_| StdError::generic_err("Stored secret malformed"))?;
+        let secret_hex = rec
+            .secret_key_hex
+            .ok_or_else(|| StdError::generic_err("Secret key not set for this VM"))?;
+        let secret_bytes = hex::decode(secret_hex)
+            .map_err(|_| StdError::generic_err("Stored secret malformed"))?;
 
-        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
-        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+        let other_pub: [u8; 32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes =
+            base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
 
-        return encrypt_secret(secret_bytes, other_pub, &report_bytes, env.block.height.to_string().into_bytes());
+        return encrypt_secret(
+            secret_bytes,
+            other_pub,
+            &report_bytes,
+            env.block.height.to_string().into_bytes(),
+        );
     }
 
-    Err(StdError::generic_err("Secret key for this image has not been created"))
+    Err(StdError::generic_err(
+        "Secret key for this image has not been created",
+    ))
 }
 
 // 3. Get Env By Image (AMD)
@@ -1274,13 +1593,24 @@ fn try_get_env_by_image_amd(
         if !amd_filter_matches(&rec.filter, &verified) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
-        let plain = rec.env_plaintext.ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
+        let plain = rec
+            .env_plaintext
+            .ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
 
-        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
-        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+        let other_pub: [u8; 32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes =
+            base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
 
-        let enc = encrypt_secret(plain.into_bytes(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())?;
-        return Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key });
+        let enc = encrypt_secret(
+            plain.into_bytes(),
+            other_pub,
+            &report_bytes,
+            env.block.height.to_string().into_bytes(),
+        )?;
+        return Ok(EnvSecretResponse {
+            encrypted_secrets_plaintext: enc.encrypted_secret_key,
+            encryption_pub_key: enc.encryption_pub_key,
+        });
     }
 
     Err(StdError::generic_err("No env secret found"))
@@ -1307,11 +1637,14 @@ fn try_get_docker_credentials_by_image_amd(
 
     if let Some(rec) = AMD_DOCKER_CREDENTIALS.get(deps.storage, &vm_uid) {
         if rec.measurement != measurement {
-            return Err(StdError::generic_err("Filter mismatch for docker credentials VM record"));
+            return Err(StdError::generic_err(
+                "Filter mismatch for docker credentials VM record",
+            ));
         }
 
-        let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
-        let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+        let other_pub: [u8; 32] = verified.report_data[0..32].try_into().unwrap();
+        let report_bytes =
+            base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
         let height_bytes = env.block.height.to_string().into_bytes();
 
         return encrypt_docker_credentials(
@@ -1323,7 +1656,9 @@ fn try_get_docker_credentials_by_image_amd(
         );
     }
 
-    Err(StdError::generic_err("No docker credentials found for this image"))
+    Err(StdError::generic_err(
+        "No docker credentials found for this image",
+    ))
 }
 
 // 5. Get Env By Service (AMD) - Reads AMD_SERVICES_MAP
@@ -1344,24 +1679,42 @@ fn try_get_env_by_service_amd(
     let verified = verify_amd_attestation(&att)
         .map_err(|e| StdError::generic_err(format!("AMD Verification failed: {:?}", e)))?;
 
-    let svc = AMD_SERVICES_MAP.get(deps.storage, &service_id)
+    let svc = AMD_SERVICES_MAP
+        .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("AMD Service not found"))?;
 
     verify_password_opt(&svc.password_hash, &password)?;
 
     let mut found = false;
     for entry in svc.filters.iter() {
-        if amd_filter_matches(&entry.filter, &verified) { found = true; break; }
+        if amd_filter_matches(&entry.filter, &verified) {
+            found = true;
+            break;
+        }
     }
-    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
+    }
 
-    let plaintext = svc.secrets_plaintext.clone().ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
+    let plaintext = svc
+        .secrets_plaintext
+        .clone()
+        .ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
 
-    let other_pub: [u8;32] = verified.report_data[0..32].try_into().unwrap();
-    let report_bytes = base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
+    let other_pub: [u8; 32] = verified.report_data[0..32].try_into().unwrap();
+    let report_bytes =
+        base64::decode(&report_b64).map_err(|_| StdError::generic_err("base64 decode"))?;
 
-    let enc = encrypt_secret(plaintext.into_bytes(), other_pub, &report_bytes, env.block.height.to_string().into_bytes())?;
-    Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key })
+    let enc = encrypt_secret(
+        plaintext.into_bytes(),
+        other_pub,
+        &report_bytes,
+        env.block.height.to_string().into_bytes(),
+    )?;
+    Ok(EnvSecretResponse {
+        encrypted_secrets_plaintext: enc.encrypted_secret_key,
+        encryption_pub_key: enc.encryption_pub_key,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -1371,7 +1724,7 @@ fn try_get_env_by_service_amd(
 /// Query to get all hardware register pairs from whitelist
 fn query_get_all_hw_registers(deps: Deps) -> StdResult<HwRegistersWhitelistResponse> {
     let mut pairs = Vec::new();
-    
+
     for result in HW_REGISTERS_WHITELIST.iter(deps.storage)? {
         let (pair, _) = result?;
         pairs.push(HwRegisterPairMsg {
@@ -1379,12 +1732,16 @@ fn query_get_all_hw_registers(deps: Deps) -> StdResult<HwRegistersWhitelistRespo
             rtmr0: pair.rtmr0,
         });
     }
-    
+
     Ok(HwRegistersWhitelistResponse { pairs })
 }
 
 /// Query to check if specific hardware register pair exists in whitelist
-fn query_check_hw_register_pair(deps: Deps, mr_td: String, rtmr0: String) -> StdResult<HwRegisterPairCheckResponse> {
+fn query_check_hw_register_pair(
+    deps: Deps,
+    mr_td: String,
+    rtmr0: String,
+) -> StdResult<HwRegisterPairCheckResponse> {
     let hw_pair = HwRegisterPair { mr_td, rtmr0 };
     let exists = HW_REGISTERS_WHITELIST.contains(deps.storage, &hw_pair);
     Ok(HwRegisterPairCheckResponse { exists })
@@ -1392,7 +1749,11 @@ fn query_check_hw_register_pair(deps: Deps, mr_td: String, rtmr0: String) -> Std
 
 // Helper: filter match vs parsed TDX
 // Now checks mr_td and rtmr0 against the whitelist instead of filter
-fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t, storage: &dyn cosmwasm_std::Storage) -> bool {
+fn filter_matches_quote(
+    f: &ImageFilter,
+    tdx: &tdx_quote_t,
+    storage: &dyn cosmwasm_std::Storage,
+) -> bool {
     let mr_seam = tdx.mr_seam.to_vec();
     let mr_signer = tdx.mr_signer_seam.to_vec();
     let mr_td = tdx.mr_td.to_vec();
@@ -1404,16 +1765,48 @@ fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t, storage: &dyn cosmwa
     let rtmr2 = tdx.rtmr2.to_vec();
     let rtmr3 = tdx.rtmr3.to_vec();
 
-    if let Some(p) = &f.mr_seam        { if p != &mr_seam   { return false; } }
-    if let Some(p) = &f.mr_signer_seam { if p != &mr_signer { return false; } }
-    if let Some(p) = &f.mr_config_id   { if p != &mr_config_id { return false; } }
-    if let Some(p) = &f.mr_owner       { if p != &mr_owner  { return false; } }
-    if let Some(p) = &f.mr_config      { if p != &mr_config { return false; } }
+    if let Some(p) = &f.mr_seam {
+        if p != &mr_seam {
+            return false;
+        }
+    }
+    if let Some(p) = &f.mr_signer_seam {
+        if p != &mr_signer {
+            return false;
+        }
+    }
+    if let Some(p) = &f.mr_config_id {
+        if p != &mr_config_id {
+            return false;
+        }
+    }
+    if let Some(p) = &f.mr_owner {
+        if p != &mr_owner {
+            return false;
+        }
+    }
+    if let Some(p) = &f.mr_config {
+        if p != &mr_config {
+            return false;
+        }
+    }
     // rtmr1, rtmr2, rtmr3 still checked against filter
-    if let Some(p) = &f.rtmr1          { if p != &rtmr1     { return false; } }
-    if let Some(p) = &f.rtmr2          { if p != &rtmr2     { return false; } }
-    if let Some(p) = &f.rtmr3          { if p != &rtmr3     { return false; } }
-    
+    if let Some(p) = &f.rtmr1 {
+        if p != &rtmr1 {
+            return false;
+        }
+    }
+    if let Some(p) = &f.rtmr2 {
+        if p != &rtmr2 {
+            return false;
+        }
+    }
+    if let Some(p) = &f.rtmr3 {
+        if p != &rtmr3 {
+            return false;
+        }
+    }
+
     // NEW: Check mr_td and rtmr0 against whitelist instead of filter
     // Create hex strings for the whitelist check
     let mr_td_hex = hex::encode(&mr_td);
@@ -1422,12 +1815,12 @@ fn filter_matches_quote(f: &ImageFilter, tdx: &tdx_quote_t, storage: &dyn cosmwa
         mr_td: mr_td_hex,
         rtmr0: rtmr0_hex,
     };
-    
+
     // Check if this pair exists in whitelist
     if !HW_REGISTERS_WHITELIST.contains(storage, &hw_pair) {
         return false;
     }
-    
+
     true
 }
 
@@ -1440,7 +1833,9 @@ pub fn try_get_env_by_service(
     collateral: Vec<u8>,
     password: Option<String>,
 ) -> StdResult<EnvSecretResponse> {
-    let svc = SERVICES_MAP.get(deps.storage, &service_id).ok_or_else(|| StdError::generic_err("Service not found"))?;
+    let svc = SERVICES_MAP
+        .get(deps.storage, &service_id)
+        .ok_or_else(|| StdError::generic_err("Service not found"))?;
     verify_password_opt(&svc.password_hash, &password)?;
 
     let tdx = parse_tdx_attestation(&quote, &collateral)
@@ -1448,14 +1843,32 @@ pub fn try_get_env_by_service(
 
     let mut found = false;
     for entry in svc.filters.iter() {
-        if filter_matches_quote(&entry.filter, &tdx, deps.storage) { found = true; break; }
+        if filter_matches_quote(&entry.filter, &tdx, deps.storage) {
+            found = true;
+            break;
+        }
     }
-    if !found { return Err(StdError::generic_err("No matching image filter found")); }
+    if !found {
+        return Err(StdError::generic_err("No matching image filter found"));
+    }
 
-    let plaintext = svc.secrets_plaintext.clone().ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
-    let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
-    let enc = encrypt_secret(plaintext.into_bytes(), other_pub, &quote, env.block.height.to_string().into_bytes())?;
-    Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key })
+    let plaintext = svc
+        .secrets_plaintext
+        .clone()
+        .ok_or_else(|| StdError::generic_err("Env secret for this service not set"))?;
+    let other_pub: [u8; 32] = tdx.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    let enc = encrypt_secret(
+        plaintext.into_bytes(),
+        other_pub,
+        &quote,
+        env.block.height.to_string().into_bytes(),
+    )?;
+    Ok(EnvSecretResponse {
+        encrypted_secrets_plaintext: enc.encrypted_secret_key,
+        encryption_pub_key: enc.encryption_pub_key,
+    })
 }
 
 pub fn try_get_docker_credentials_by_image(
@@ -1495,15 +1908,14 @@ pub fn try_get_docker_credentials_by_image(
     }
 
     // 2) Legacy fallback: scan the old Vec from the END (last-write wins)
-    let legacy_list = docker_credentials_read(deps.storage).load().unwrap_or_default();
+    let legacy_list = docker_credentials_read(deps.storage)
+        .load()
+        .unwrap_or_default();
     if let Some(rec) = legacy_list.iter().rev().find(|cred| {
-            cred.rtmr1 == r1
+        cred.rtmr1 == r1
             && cred.rtmr2 == r2
             && cred.rtmr3 == r3
-            && cred.vm_uid
-            .as_ref()
-            .map(|v| v == &vm_uid)
-            .unwrap_or(true) // legacy may have vm_uid=None
+            && cred.vm_uid.as_ref().map(|v| v == &vm_uid).unwrap_or(true) // legacy may have vm_uid=None
     }) {
         let other_pub: [u8; 32] = tdx.report_data[0..32]
             .try_into()
@@ -1529,27 +1941,34 @@ fn query_image_filters(deps: Deps, service_id: String) -> StdResult<ListImageRes
         .get(deps.storage, &service_id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
 
-    let list = svc.filters.iter().map(|entry| {
-        let f = &entry.filter;
-        ImageFilterHexEntry {
-            filter: ImageFilterHex {
-                mr_seam: f.mr_seam.as_ref().map(|b| hex::encode(b)),
-                mr_signer_seam: f.mr_signer_seam.as_ref().map(|b| hex::encode(b)),
-                mr_td: f.mr_td.as_ref().map(|b| hex::encode(b)),
-                mr_config_id: f.mr_config_id.as_ref().map(|b| hex::encode(b)),
-                mr_owner: f.mr_owner.as_ref().map(|b| hex::encode(b)),
-                mr_config: f.mr_config.as_ref().map(|b| hex::encode(b)),
-                rtmr0: f.rtmr0.as_ref().map(|b| hex::encode(b)),
-                rtmr1: f.rtmr1.as_ref().map(|b| hex::encode(b)),
-                rtmr2: f.rtmr2.as_ref().map(|b| hex::encode(b)),
-                rtmr3: f.rtmr3.as_ref().map(|b| hex::encode(b)),
-            },
-            description: entry.description.clone(),
-            timestamp: entry.timestamp,
-        }
-    }).collect();
+    let list = svc
+        .filters
+        .iter()
+        .map(|entry| {
+            let f = &entry.filter;
+            ImageFilterHexEntry {
+                filter: ImageFilterHex {
+                    mr_seam: f.mr_seam.as_ref().map(|b| hex::encode(b)),
+                    mr_signer_seam: f.mr_signer_seam.as_ref().map(|b| hex::encode(b)),
+                    mr_td: f.mr_td.as_ref().map(|b| hex::encode(b)),
+                    mr_config_id: f.mr_config_id.as_ref().map(|b| hex::encode(b)),
+                    mr_owner: f.mr_owner.as_ref().map(|b| hex::encode(b)),
+                    mr_config: f.mr_config.as_ref().map(|b| hex::encode(b)),
+                    rtmr0: f.rtmr0.as_ref().map(|b| hex::encode(b)),
+                    rtmr1: f.rtmr1.as_ref().map(|b| hex::encode(b)),
+                    rtmr2: f.rtmr2.as_ref().map(|b| hex::encode(b)),
+                    rtmr3: f.rtmr3.as_ref().map(|b| hex::encode(b)),
+                },
+                description: entry.description.clone(),
+                timestamp: entry.timestamp,
+            }
+        })
+        .collect();
 
-    Ok(ListImageResponse {service_id,  filters: list })
+    Ok(ListImageResponse {
+        service_id,
+        filters: list,
+    })
 }
 
 /// NEW: Retrieve the environment secret using an attestation.
@@ -1571,33 +1990,56 @@ pub fn try_get_env_by_image(
         if !filter_matches_quote(&rec.filter, &tdx, deps.storage) {
             return Err(StdError::generic_err("Filter mismatch for VM record"));
         }
-        let plain = rec.env_plaintext.ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
-        let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
-        let enc = encrypt_secret(plain.into_bytes(), other_pub, &quote, env.block.height.to_string().into_bytes())?;
-        return Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key });
+        let plain = rec
+            .env_plaintext
+            .ok_or_else(|| StdError::generic_err("Env secret not set for this VM"))?;
+        let other_pub: [u8; 32] = tdx.report_data[0..32]
+            .try_into()
+            .map_err(|_| StdError::generic_err("Bad report_data"))?;
+        let enc = encrypt_secret(
+            plain.into_bytes(),
+            other_pub,
+            &quote,
+            env.block.height.to_string().into_bytes(),
+        )?;
+        return Ok(EnvSecretResponse {
+            encrypted_secrets_plaintext: enc.encrypted_secret_key,
+            encryption_pub_key: enc.encryption_pub_key,
+        });
     }
 
     // Legacy fallback (scan vector)
-    let legacy = env_secrets_read(deps.storage).load().map_err(|_| StdError::generic_err("Legacy env storage missing"))?;
-    let r1 = tdx.rtmr1.to_vec(); let r2 = tdx.rtmr2.to_vec(); let r3 = tdx.rtmr3.to_vec();
+    let legacy = env_secrets_read(deps.storage)
+        .load()
+        .map_err(|_| StdError::generic_err("Legacy env storage missing"))?;
+    let r1 = tdx.rtmr1.to_vec();
+    let r2 = tdx.rtmr2.to_vec();
+    let r3 = tdx.rtmr3.to_vec();
     let candidate = legacy
         .iter()
         .rev()
         .find(|e| {
-                e.rtmr1 == r1
+            e.rtmr1 == r1
                 && e.rtmr2 == r2
                 && e.rtmr3 == r3
-                && e.vm_uid
-                .as_ref()
-                .map(|v| v == &vm_uid)
-                .unwrap_or(true) // legacy may have vm_uid = None
+                && e.vm_uid.as_ref().map(|v| v == &vm_uid).unwrap_or(true) // legacy may have vm_uid = None
         })
         .cloned() // we iter() above, so clone the found EnvSecret
         .ok_or_else(|| StdError::generic_err("No env secret found"))?;
 
-    let other_pub: [u8;32] = tdx.report_data[0..32].try_into().map_err(|_| StdError::generic_err("Bad report_data"))?;
-    let enc = encrypt_secret(candidate.secrets_plaintext.into_bytes(), other_pub, &quote, env.block.height.to_string().into_bytes())?;
-    Ok(EnvSecretResponse { encrypted_secrets_plaintext: enc.encrypted_secret_key, encryption_pub_key: enc.encryption_pub_key })
+    let other_pub: [u8; 32] = tdx.report_data[0..32]
+        .try_into()
+        .map_err(|_| StdError::generic_err("Bad report_data"))?;
+    let enc = encrypt_secret(
+        candidate.secrets_plaintext.into_bytes(),
+        other_pub,
+        &quote,
+        env.block.height.to_string().into_bytes(),
+    )?;
+    Ok(EnvSecretResponse {
+        encrypted_secrets_plaintext: enc.encrypted_secret_key,
+        encryption_pub_key: enc.encryption_pub_key,
+    })
 }
 
 /// Returns information about a service by its ID.
@@ -1605,7 +2047,11 @@ fn query_service(deps: Deps, id: String) -> StdResult<ServiceResponse> {
     let svc = SERVICES_MAP
         .get(deps.storage, &id)
         .ok_or_else(|| StdError::generic_err("Service not found"))?;
-    Ok(ServiceResponse { id: svc.id, name: svc.name, admin: svc.admin.into_string() })
+    Ok(ServiceResponse {
+        id: svc.id,
+        name: svc.name,
+        admin: svc.admin.into_string(),
+    })
 }
 
 /// Returns a list of all services.
@@ -1624,12 +2070,12 @@ fn query_services(deps: Deps) -> StdResult<Vec<ServiceResponse>> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
     use super::*;
     use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
-    use cosmwasm_std::{from_binary, StdError};
     use cosmwasm_std::VoteOption::No;
+    use cosmwasm_std::{from_binary, StdError};
+    use std::fs;
+    use std::path::Path;
 
     // Override the external function dcap_quote_verify in tests so that it always returns 0,
     // meaning error_code is 0 and verification result is 0.
@@ -1638,7 +2084,6 @@ mod tests {
     pub extern "C" fn dcap_quote_verify(_quote_ptr: u32, _collateral_ptr: u32) -> u64 {
         0
     }
-
 
     #[test]
     fn proper_initialization() {
@@ -1668,15 +2113,20 @@ mod tests {
             password_hash: None,
         };
         let res = execute(deps.as_mut(), mock_env(), info.clone(), exec_msg).unwrap();
-        assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "create_service"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "action" && attr.value == "create_service"));
 
         // Query by numeric ID 0
         let res = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetService { id: "0".to_string() },
+            QueryMsg::GetService {
+                id: "0".to_string(),
+            },
         )
-            .unwrap();
+        .unwrap();
         let service: ServiceResponse = from_binary(&res).unwrap();
         assert_eq!(service.name, "TestService");
         assert_eq!(service.admin, "creator");
@@ -1688,12 +2138,16 @@ mod tests {
         let admin_info = mock_info("admin", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService {service_id: "0".to_string(), name: "ServiceWithImage".to_string(), password_hash: None};
+        let create_msg = ExecuteMsg::CreateService {
+            service_id: "0".to_string(),
+            name: "ServiceWithImage".to_string(),
+            password_hash: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
-            mr_td: Some(vec![1,2,3,4,5]),
+            mr_td: Some(vec![1, 2, 3, 4, 5]),
             mr_config_id: None,
             mr_owner: None,
             mr_config: None,
@@ -1703,12 +2157,26 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter: image_filter.clone(), description: "TestImage".to_string(), timestamp: None};
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            image_filter: image_filter.clone(),
+            description: "TestImage".to_string(),
+            timestamp: None,
+        };
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
-        assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_image_to_service"));
-        let remove_msg = ExecuteMsg::RemoveImageFromService { service_id: "0".to_string(), image_filter };
+        assert!(res
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "action" && attr.value == "add_image_to_service"));
+        let remove_msg = ExecuteMsg::RemoveImageFromService {
+            service_id: "0".to_string(),
+            image_filter,
+        };
         let res = execute(deps.as_mut(), mock_env(), admin_info.clone(), remove_msg).unwrap();
-        assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "remove_image_from_service"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "action" && attr.value == "remove_image_from_service"));
     }
 
     #[test]
@@ -1717,12 +2185,16 @@ mod tests {
         let admin_info = mock_info("admin", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService { name: "ServiceForKey".to_string(), service_id: "0".to_string(), password_hash: None};
+        let create_msg = ExecuteMsg::CreateService {
+            name: "ServiceForKey".to_string(),
+            service_id: "0".to_string(),
+            password_hash: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         // Add an image filter that specifies mr_td must equal a specific vector of 48 bytes.
-        let mut expected_mr_td = vec![0u8;48];
-        expected_mr_td[..5].copy_from_slice(&[1,2,3,4,5]);
-        let expected_rtmr0 = vec![0u8;48]; // all zeros
+        let mut expected_mr_td = vec![0u8; 48];
+        expected_mr_td[..5].copy_from_slice(&[1, 2, 3, 4, 5]);
+        let expected_rtmr0 = vec![0u8; 48]; // all zeros
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
@@ -1736,24 +2208,31 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), image_filter, description: "TestImage".to_string(), timestamp: None };
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            image_filter,
+            description: "TestImage".to_string(),
+            timestamp: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
-        
+
         // Add hardware registers to whitelist
         let hw_pair = HwRegisterPairMsg {
             mr_td: hex::encode(&expected_mr_td),
             rtmr0: hex::encode(&expected_rtmr0),
         };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
-        
+
         // Construct a dummy quote buffer of size_of::<tdx_quote_t>()
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
 
         // set quote version to 4 and tee_type to 0x81
-        quote[0] = 4;  // version low byte
-        quote[1] = 0;  // version high byte
+        quote[0] = 4; // version low byte
+        quote[1] = 0; // version high byte
 
         // Set tee_type = 0x81 (129) as a u32 in little endian:
         quote[4] = 129; // 0x81
@@ -1765,14 +2244,19 @@ mod tests {
         // tdx_quote_t layout: header (2+2+4+4+16+20 = 48 bytes), then tcb_svn (16), mr_seam (48), mr_signer_seam (48), seam_attributes (8), td_attributes (8), xfam (8), then mr_td (48).
         // mr_td offset = 48 + 16 + 48 + 48 + 8 + 8 + 8 = 184.
         let mr_td_offset = 184;
-        quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&expected_mr_td);
         // rtmr0 offset = mr_td_offset + 48 + 48 + 48 + 48 = 184 + 192 = 376
         let rtmr0_offset = 376;
-        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
-        
+        quote[rtmr0_offset..rtmr0_offset + 48].copy_from_slice(&expected_rtmr0);
+
         // Dummy collateral
         let collateral = vec![0u8; 10];
-        let get_msg = QueryMsg::GetSecretKey { service_id: "0".to_string(), quote: quote.clone(), collateral: collateral.clone(), password: None };
+        let get_msg = QueryMsg::GetSecretKey {
+            service_id: "0".to_string(),
+            quote: quote.clone(),
+            collateral: collateral.clone(),
+            password: None,
+        };
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!secret_key.encrypted_secret_key.is_empty());
@@ -1784,16 +2268,14 @@ mod tests {
         // Read the quote and collateral data from files.
         let quote_path = Path::new("tests/quote.txt");
         let collateral_path = Path::new("tests/collateral.txt");
-        let quote_hex = fs::read_to_string(quote_path)
-            .expect("Failed to read quote.txt");
-        let collateral_hex = fs::read_to_string(collateral_path)
-            .expect("Failed to read collateral.txt");
+        let quote_hex = fs::read_to_string(quote_path).expect("Failed to read quote.txt");
+        let collateral_hex =
+            fs::read_to_string(collateral_path).expect("Failed to read collateral.txt");
 
         // Decode the hex strings into byte vectors (trim to remove any extra whitespace/newlines)
-        let quote = hex::decode(quote_hex.trim())
-            .expect("Failed to decode quote hex");
-        let collateral = hex::decode(collateral_hex.trim())
-            .expect("Failed to decode collateral hex");
+        let quote = hex::decode(quote_hex.trim()).expect("Failed to decode quote hex");
+        let collateral =
+            hex::decode(collateral_hex.trim()).expect("Failed to decode collateral hex");
 
         // Parse to extract mr_td and rtmr0 for whitelist
         let tdx = parse_tdx_attestation(&quote, &collateral).expect("Failed to parse attestation");
@@ -1807,12 +2289,21 @@ mod tests {
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
 
         // Add hardware registers to whitelist
-        let hw_pair = HwRegisterPairMsg { mr_td: mr_td_hex, rtmr0: rtmr0_hex };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let hw_pair = HwRegisterPairMsg {
+            mr_td: mr_td_hex,
+            rtmr0: rtmr0_hex,
+        };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
 
         // Create a new service.
-        let create_msg = ExecuteMsg::CreateService { name: "ServiceForFileKey".to_string(), service_id: "0".to_string(), password_hash: None};
+        let create_msg = ExecuteMsg::CreateService {
+            name: "ServiceForFileKey".to_string(),
+            service_id: "0".to_string(),
+            password_hash: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
 
         // Add an image filter that accepts any quote (all fields are None).
@@ -1829,11 +2320,21 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter, timestamp: None };
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            description: "TestImage".to_string(),
+            image_filter,
+            timestamp: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
 
         // Query the secret key using the quote and collateral read from file.
-        let get_msg = QueryMsg::GetSecretKey { service_id: "0".to_string(), quote, collateral, password: None};
+        let get_msg = QueryMsg::GetSecretKey {
+            service_id: "0".to_string(),
+            quote,
+            collateral,
+            password: None,
+        };
         let res = query(deps.as_ref(), mock_env(), get_msg).unwrap();
         let secret_key: SecretKeyResponse = from_binary(&res).unwrap();
 
@@ -1854,12 +2355,16 @@ mod tests {
         let other_info = mock_info("other", &[]);
         let init_msg = InstantiateMsg {};
         let _ = instantiate(deps.as_mut(), mock_env(), admin_info.clone(), init_msg).unwrap();
-        let create_msg = ExecuteMsg::CreateService { name: "UnauthorizedTest".to_string(), service_id: "0".to_string(), password_hash: None};
+        let create_msg = ExecuteMsg::CreateService {
+            name: "UnauthorizedTest".to_string(),
+            service_id: "0".to_string(),
+            password_hash: None,
+        };
         let _ = execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
-            mr_td: Some(vec![1,2,3]),
+            mr_td: Some(vec![1, 2, 3]),
             mr_config_id: None,
             mr_owner: None,
             mr_config: None,
@@ -1869,12 +2374,17 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { service_id: "0".to_string(), description: "TestImage".to_string(), image_filter, timestamp: None };
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            description: "TestImage".to_string(),
+            image_filter,
+            timestamp: None,
+        };
         let res = execute(deps.as_mut(), mock_env(), other_info.clone(), add_msg);
         match res {
             Err(StdError::GenericErr { msg, .. }) => {
                 assert_eq!(msg, "Only the service admin can add image filter");
-            },
+            }
             _ => panic!("Expected unauthorized error"),
         }
     }
@@ -1892,8 +2402,13 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             info.clone(),
-            ExecuteMsg::CreateService { service_id: svc_id.clone(), name: "Svc".to_string(), password_hash: None},
-        ).unwrap();
+            ExecuteMsg::CreateService {
+                service_id: svc_id.clone(),
+                name: "Svc".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         // Add an image filter with known bytes and description
         let filter_bytes = vec![1u8, 2, 3];
@@ -1921,14 +2436,18 @@ mod tests {
                 description: desc.clone(),
                 timestamp: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Query the list of filters
         let res = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::ListImageFilters { service_id: svc_id.clone() },
-        ).unwrap();
+            QueryMsg::ListImageFilters {
+                service_id: svc_id.clone(),
+            },
+        )
+        .unwrap();
         let resp: ListImageResponse = from_binary(&res).unwrap();
 
         println!("Resp: {:#?}", resp);
@@ -1944,20 +2463,32 @@ mod tests {
 
     #[test]
     fn add_and_get_secret_key_by_image() {
-        use std::fs;
-        use std::path::Path;
         use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
         use cosmwasm_std::{from_binary, StdError};
         use hex;
+        use std::fs;
+        use std::path::Path;
 
         // Initialize contract
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
 
         // Read quote & collateral from files
-        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt")).unwrap().trim().to_string();
-        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt")).unwrap().trim().to_string();
+        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt"))
+            .unwrap()
+            .trim()
+            .to_string();
         let quote = hex::decode(&quote_hex).unwrap();
         let collateral = hex::decode(&collateral_hex).unwrap();
 
@@ -1972,7 +2503,9 @@ mod tests {
             mr_td: hex::encode(&tdx.mr_td),
             rtmr0: hex::encode(&tdx.rtmr0),
         };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
 
         let image_filter = MsgImageFilter {
@@ -1994,15 +2527,24 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin_info.clone(),
-            ExecuteMsg::AddSecretKeyByImage { image_filter: image_filter.clone(), password_hash: None},
-        ).unwrap();
+            ExecuteMsg::AddSecretKeyByImage {
+                image_filter: image_filter.clone(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         // Now query by image
         let query_bin = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetSecretKeyByImage { quote: quote.clone(), collateral: collateral.clone(), password: None}
-        ).unwrap();
+            QueryMsg::GetSecretKeyByImage {
+                quote: quote.clone(),
+                collateral: collateral.clone(),
+                password: None,
+            },
+        )
+        .unwrap();
         let resp: SecretKeyResponse = from_binary(&query_bin).unwrap();
 
         println!("resp: {:#?}", resp);
@@ -2032,14 +2574,14 @@ mod tests {
             rtmr1: Some(vec![20u8; 48]),
             rtmr2: Some(vec![30u8; 48]),
             rtmr3: Some(vec![40u8; 48]),
-            vm_uid: Some("my-vm-id".into())
+            vm_uid: Some("my-vm-id".into()),
         };
 
         // Prepare the ExecuteMsg with AddEnvByImage.
         let exec_msg = ExecuteMsg::AddEnvByImage {
             image_filter: image_filter.clone(),
             secrets_plaintext: "env_secret_plaintext".to_string(),
-            password_hash: None
+            password_hash: None,
         };
 
         // Execute the message.
@@ -2047,7 +2589,10 @@ mod tests {
             .expect("AddEnvByImage execution failed");
 
         // Check that the response contains an attribute "action" with value "add_env_by_image".
-        assert!(res.attributes.iter().any(|attr| attr.key == "action" && attr.value == "add_env_by_image"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "action" && attr.value == "add_env_by_image"));
     }
 
     #[test]
@@ -2068,8 +2613,8 @@ mod tests {
         // The header layout is: version (u16), key_type (u16), tee_type (u32), reserved (u32), qe_vendor_id ([u8;16]), user_data ([u8;20]).
         // We'll set version = 4 and tee_type = 0x81.
         // Assume little-endian encoding.
-        quote[0] = 4;  // version low byte
-        quote[1] = 0;  // version high byte
+        quote[0] = 4; // version low byte
+        quote[1] = 0; // version high byte
 
         // key_type can remain 0.
         // Set tee_type = 0x81 (129) as a u32 in little endian:
@@ -2114,7 +2659,13 @@ mod tests {
 
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
 
         // Add hardware registers to whitelist
         let mr_td_bytes = vec![10u8; 48];
@@ -2123,7 +2674,9 @@ mod tests {
             mr_td: hex::encode(&mr_td_bytes),
             rtmr0: hex::encode(&rtmr0_bytes),
         };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
 
         // Add env secret
@@ -2147,15 +2700,20 @@ mod tests {
             ExecuteMsg::AddEnvByImage {
                 image_filter: image_filter.clone(),
                 secrets_plaintext: "env_secret_plaintext".to_string(),
-                password_hash: None
+                password_hash: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build dummy quote
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
-        quote[0] = 4; quote[1] = 0;
-        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+        quote[0] = 4;
+        quote[1] = 0;
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
 
         let mr_td_offset = 184;
         quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&[10u8; 48]);
@@ -2169,7 +2727,9 @@ mod tests {
         // report_data:
         let rd_off = quote_len - 64;
         // 32-byte pubkey stub:
-        for i in rd_off..(rd_off + 32) { quote[i] = 1; }
+        for i in rd_off..(rd_off + 32) {
+            quote[i] = 1;
+        }
         // 16-byte vm_uid
         quote[rd_off + 32..rd_off + 48].copy_from_slice(&vm_uid_bytes);
 
@@ -2177,8 +2737,13 @@ mod tests {
         let res_bin = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetEnvByImage { quote, collateral, password: None}
-        ).unwrap();
+            QueryMsg::GetEnvByImage {
+                quote,
+                collateral,
+                password: None,
+            },
+        )
+        .unwrap();
         let resp: EnvSecretResponse = from_binary(&res_bin).unwrap();
 
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
@@ -2189,17 +2754,22 @@ mod tests {
 
     #[test]
     fn get_env_by_image_from_file_returns_secret() {
-        use std::fs;
-        use std::path::Path;
         use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
         use cosmwasm_std::{from_binary, StdError};
         use hex;
+        use std::fs;
+        use std::path::Path;
 
         // --- Setup contract and admin ---
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {})
-            .expect("instantiate should succeed");
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .expect("instantiate should succeed");
 
         // --- Step 1. Read quote & collateral from files ---
         let quote_hex = fs::read_to_string(Path::new("tests/quote.txt"))
@@ -2215,8 +2785,7 @@ mod tests {
         let collateral = hex::decode(&collateral_hex).expect("decode collateral hex");
 
         // --- Step 2. Parse the TDX attestation ---
-        let tdx = parse_tdx_attestation(&quote, &collateral)
-            .expect("attestation should parse");
+        let tdx = parse_tdx_attestation(&quote, &collateral).expect("attestation should parse");
 
         // --- Step 3. Extract the VM UID from report_data[32..48] ---
         let vm_uid = tdx.report_data[32..48].to_vec();
@@ -2226,7 +2795,9 @@ mod tests {
             mr_td: hex::encode(&tdx.mr_td),
             rtmr0: hex::encode(&tdx.rtmr0),
         };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg)
             .expect("whitelist should be added");
 
@@ -2251,27 +2822,43 @@ mod tests {
             ExecuteMsg::AddEnvByImage {
                 image_filter: image_filter.clone(),
                 secrets_plaintext: "env_secret_plaintext".to_string(),
-                password_hash: None
+                password_hash: None,
             },
         )
-            .expect("AddEnvByImage must succeed");
+        .expect("AddEnvByImage must succeed");
 
         // --- Step 5. Query GetEnvByImage and verify ---
         let res_bin = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetEnvByImage { quote: quote.clone(), collateral: collateral.clone(), password: None},
+            QueryMsg::GetEnvByImage {
+                quote: quote.clone(),
+                collateral: collateral.clone(),
+                password: None,
+            },
         )
-            .expect("query GetEnvByImage");
+        .expect("query GetEnvByImage");
         let resp: EnvSecretResponse = from_binary(&res_bin).unwrap();
 
         println!("resp: {:#?}", resp);
 
         // both fields should be non‐empty and valid hex
-        assert!(!resp.encrypted_secrets_plaintext.is_empty(), "encrypted_secrets_plaintext must not be empty");
-        assert!(hex::decode(&resp.encrypted_secrets_plaintext).is_ok(), "must be valid hex");
-        assert!(!resp.encryption_pub_key.is_empty(), "encryption_pub_key must not be empty");
-        assert!(hex::decode(&resp.encryption_pub_key).is_ok(), "must be valid hex");
+        assert!(
+            !resp.encrypted_secrets_plaintext.is_empty(),
+            "encrypted_secrets_plaintext must not be empty"
+        );
+        assert!(
+            hex::decode(&resp.encrypted_secrets_plaintext).is_ok(),
+            "must be valid hex"
+        );
+        assert!(
+            !resp.encryption_pub_key.is_empty(),
+            "encryption_pub_key must not be empty"
+        );
+        assert!(
+            hex::decode(&resp.encryption_pub_key).is_ok(),
+            "must be valid hex"
+        );
     }
 
     #[test]
@@ -2282,7 +2869,13 @@ mod tests {
         let public_key: [u8; 32] = [1; 32];
 
         // Call the encryption function.
-        let encrypted = encrypt_secret(secret_key, public_key, "test".to_string().as_bytes(), "52".to_string().into_bytes()).unwrap();
+        let encrypted = encrypt_secret(
+            secret_key,
+            public_key,
+            "test".to_string().as_bytes(),
+            "52".to_string().into_bytes(),
+        )
+        .unwrap();
 
         println!("encrypted: {:?}", encrypted);
 
@@ -2298,9 +2891,9 @@ mod tests {
 
     #[test]
     fn prepare_secretcli_get_secret_key_command() {
+        use serde_json;
         use std::fs;
         use std::path::Path;
-        use serde_json;
 
         // Define paths for the quote and collateral files.
         let quote_path = Path::new("tests/quote.txt");
@@ -2349,16 +2942,14 @@ mod tests {
         // Read the quote and collateral hex strings from disk
         let quote_path = Path::new("tests/quote.txt");
         let collateral_path = Path::new("tests/collateral.txt");
-        let quote_hex = fs::read_to_string(quote_path)
-            .expect("Failed to read tests/quote.txt");
-        let collateral_hex = fs::read_to_string(collateral_path)
-            .expect("Failed to read tests/collateral.txt");
+        let quote_hex = fs::read_to_string(quote_path).expect("Failed to read tests/quote.txt");
+        let collateral_hex =
+            fs::read_to_string(collateral_path).expect("Failed to read tests/collateral.txt");
 
         // Decode the hex into raw bytes
-        let quote = hex::decode(quote_hex.trim())
-            .expect("Failed to decode quote hex");
-        let collateral = hex::decode(collateral_hex.trim())
-            .expect("Failed to decode collateral hex");
+        let quote = hex::decode(quote_hex.trim()).expect("Failed to decode quote hex");
+        let collateral =
+            hex::decode(collateral_hex.trim()).expect("Failed to decode collateral hex");
 
         // Parse the TDX attestation
         let tdx = parse_tdx_attestation(&quote, &collateral)
@@ -2372,7 +2963,10 @@ mod tests {
         println!("report_data: {}", report_data_hex);
 
         // Assert that report_data is non-empty
-        assert!(!report_data_hex.is_empty(), "report_data should not be empty");
+        assert!(
+            !report_data_hex.is_empty(),
+            "report_data should not be empty"
+        );
     }
 
     #[test]
@@ -2384,11 +2978,23 @@ mod tests {
         // Initialize contract
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
 
         // Read quote & collateral from files
-        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt")).unwrap().trim().to_string();
-        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt")).unwrap().trim().to_string();
+        let quote_hex = fs::read_to_string(Path::new("tests/quote.txt"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let collateral_hex = fs::read_to_string(Path::new("tests/collateral.txt"))
+            .unwrap()
+            .trim()
+            .to_string();
         let quote = hex::decode(&quote_hex).unwrap();
         let collateral = hex::decode(&collateral_hex).unwrap();
 
@@ -2422,14 +3028,19 @@ mod tests {
                 username: "testuser".to_string(),
                 password_plaintext: "testpassword".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Now query by image
         let query_bin = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetDockerCredentialsByImage { quote: quote.clone(), collateral: collateral.clone() }
-        ).unwrap();
+            QueryMsg::GetDockerCredentialsByImage {
+                quote: quote.clone(),
+                collateral: collateral.clone(),
+            },
+        )
+        .unwrap();
 
         let resp: DockerCredentialsResponse = from_binary(&query_bin).unwrap();
 
@@ -2449,16 +3060,28 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string(), password_hash: None}
-        ).unwrap();
+            ExecuteMsg::CreateService {
+                service_id: "svc1".to_string(),
+                name: "Test".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
         // Add env secret
         let res = execute(
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::AddEnvByService { service_id: "svc1".to_string(), secrets_plaintext: "secret!".to_string() }
-        ).unwrap();
-        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "add_env_by_service"));
+            ExecuteMsg::AddEnvByService {
+                service_id: "svc1".to_string(),
+                secrets_plaintext: "secret!".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(res
+            .attributes
+            .iter()
+            .any(|a| a.key == "action" && a.value == "add_env_by_service"));
     }
 
     #[test]
@@ -2470,9 +3093,13 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string(), password_hash: None}
-        ).unwrap();
-
+            ExecuteMsg::CreateService {
+                service_id: "svc1".to_string(),
+                name: "Test".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         // IMPORTANT: add at least one image filter so filter matching passes
         execute(
@@ -2481,11 +3108,24 @@ mod tests {
             admin.clone(),
             ExecuteMsg::AddImageToService {
                 service_id: "svc1".to_string(),
-                image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
+                image_filter: MsgImageFilter {
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
+                    vm_uid: None,
+                },
                 description: "".to_string(),
                 timestamp: None,
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Add hardware registers to whitelist (dummy quote has all zeros)
         execute(
@@ -2498,17 +3138,27 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build dummy quote
         let quote_len = std::mem::size_of::<tdx_quote_t>();
-        let mut quote = vec![0u8; quote_len]; quote[0]=4; quote[4]=129;
-        let collateral = vec![0u8;10];
+        let mut quote = vec![0u8; quote_len];
+        quote[0] = 4;
+        quote[4] = 129;
+        let collateral = vec![0u8; 10];
         let err = try_get_env_by_service(
-            deps.as_ref(), mock_env(), "svc1".to_string(), quote, collateral, None
+            deps.as_ref(),
+            mock_env(),
+            "svc1".to_string(),
+            quote,
+            collateral,
+            None,
         );
         match err {
-            Err(StdError::GenericErr { msg, .. }) => assert_eq!(msg, "Env secret for this service not set"),
+            Err(StdError::GenericErr { msg, .. }) => {
+                assert_eq!(msg, "Env secret for this service not set")
+            }
             _ => panic!("Expected GenericErr"),
         }
     }
@@ -2520,9 +3170,16 @@ mod tests {
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
         // Create and add filter
         execute(
-            deps.as_mut(), mock_env(), admin.clone(),
-            ExecuteMsg::CreateService { service_id: "svc1".to_string(), name: "Test".to_string(), password_hash: None}
-        ).unwrap();
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateService {
+                service_id: "svc1".to_string(),
+                name: "Test".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
         // reuse existing AddImageToService test setup to ensure a matching filter exists
         // ... (add a filter requiring no specific fields to match)
         execute(
@@ -2531,12 +3188,25 @@ mod tests {
             admin.clone(),
             ExecuteMsg::AddImageToService {
                 service_id: "svc1".to_string(),
-                image_filter: MsgImageFilter { mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None, mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None },
+                image_filter: MsgImageFilter {
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
+                    vm_uid: None,
+                },
                 description: "".to_string(),
                 timestamp: None,
-            }
-        ).unwrap();
-        
+            },
+        )
+        .unwrap();
+
         // Add hardware registers to whitelist
         execute(
             deps.as_mut(),
@@ -2548,22 +3218,37 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         // Add service env secret
         execute(
-            deps.as_mut(), mock_env(), admin.clone(),
-            ExecuteMsg::AddEnvByService { service_id: "svc1".to_string(), secrets_plaintext: "supersecret".to_string() }
-        ).unwrap();
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddEnvByService {
+                service_id: "svc1".to_string(),
+                secrets_plaintext: "supersecret".to_string(),
+            },
+        )
+        .unwrap();
         // Query it via attestation
         let quote_len = std::mem::size_of::<tdx_quote_t>();
-        let mut quote = vec![0u8; quote_len]; quote[0]=4; quote[4]=129;
-        let collateral = vec![0u8;10];
+        let mut quote = vec![0u8; quote_len];
+        quote[0] = 4;
+        quote[4] = 129;
+        let collateral = vec![0u8; 10];
         let bin = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetEnvByService { service_id: "svc1".to_string(), quote, collateral, password: None}
-        ).unwrap();
+            QueryMsg::GetEnvByService {
+                service_id: "svc1".to_string(),
+                quote,
+                collateral,
+                password: None,
+            },
+        )
+        .unwrap();
         let resp: EnvSecretResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
@@ -2579,13 +3264,26 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::CreateService { service_id: "svc".into(), name: "N".into(), password_hash: None}
-        ).unwrap();
+            ExecuteMsg::CreateService {
+                service_id: "svc".into(),
+                name: "N".into(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         let image_filter = MsgImageFilter {
-            mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![1;48]),
-            mr_config_id: None, mr_owner: None, mr_config: None,
-            rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None,
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(vec![1; 48]),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+            vm_uid: None,
         };
 
         let explicit_ts = 1_725_000_000u64;
@@ -2597,9 +3295,10 @@ mod tests {
                 service_id: "svc".into(),
                 image_filter: image_filter.clone(),
                 description: "d".into(),
-                timestamp: Some(explicit_ts),   // <-- explicit
-            }
-        ).unwrap();
+                timestamp: Some(explicit_ts), // <-- explicit
+            },
+        )
+        .unwrap();
 
         // Read back from storage and assert timestamp
         let svc = SERVICES_MAP.get(&deps.storage, &"svc".to_string()).unwrap();
@@ -2608,7 +3307,10 @@ mod tests {
     }
     #[test]
     fn add_image_without_timestamp_uses_block_time() {
-        use cosmwasm_std::{testing::{mock_dependencies, mock_info}, Timestamp};
+        use cosmwasm_std::{
+            testing::{mock_dependencies, mock_info},
+            Timestamp,
+        };
         let mut deps = mock_dependencies();
         let admin = mock_info("admin", &[]);
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
@@ -2617,13 +3319,26 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::CreateService { service_id: "svc".into(), name: "N".into(), password_hash: None}
-        ).unwrap();
+            ExecuteMsg::CreateService {
+                service_id: "svc".into(),
+                name: "N".into(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         let image_filter = MsgImageFilter {
-            mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![2;48]),
-            mr_config_id: None, mr_owner: None, mr_config: None,
-            rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None, vm_uid: None,
+            mr_seam: None,
+            mr_signer_seam: None,
+            mr_td: Some(vec![2; 48]),
+            mr_config_id: None,
+            mr_owner: None,
+            mr_config: None,
+            rtmr0: None,
+            rtmr1: None,
+            rtmr2: None,
+            rtmr3: None,
+            vm_uid: None,
         };
 
         // Prepare env with a known timestamp
@@ -2638,9 +3353,10 @@ mod tests {
                 service_id: "svc".into(),
                 image_filter: image_filter.clone(),
                 description: "d2".into(),
-                timestamp: None,               // <-- omitted -> use env.block.time
-            }
-        ).unwrap();
+                timestamp: None, // <-- omitted -> use env.block.time
+            },
+        )
+        .unwrap();
 
         let svc = SERVICES_MAP.get(&deps.storage, &"svc".to_string()).unwrap();
         assert_eq!(svc.filters.len(), 1);
@@ -2649,11 +3365,11 @@ mod tests {
 
     #[test]
     fn migrate_moves_services_v1_to_v2() {
-        use cosmwasm_std::testing::{mock_dependencies, mock_env};
-        use cosmwasm_std::Addr;
-        use crate::state::*;
         use crate::contract::migrate;
         use crate::msg::MigrateMsg;
+        use crate::state::*;
+        use cosmwasm_std::testing::{mock_dependencies, mock_env};
+        use cosmwasm_std::Addr;
 
         let mut deps = mock_dependencies();
 
@@ -2663,21 +3379,28 @@ mod tests {
             id: "svc-old-1".into(),
             name: "Legacy".into(),
             admin: Addr::unchecked("admin"),
-            filters: vec![
-                FilterEntry {
-                    filter: ImageFilter {
-                        mr_seam: None, mr_signer_seam: None, mr_td: Some(vec![1; 48]),
-                        mr_config_id: None, mr_owner: None, mr_config: None,
-                        rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
-                    },
-                    description: "legacy-filter".into(),
-                    timestamp: None
-                }
-            ],
+            filters: vec![FilterEntry {
+                filter: ImageFilter {
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: Some(vec![1; 48]),
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
+                },
+                description: "legacy-filter".into(),
+                timestamp: None,
+            }],
             secret_key: vec![9; 32],
             secrets_plaintext: Some("legacy-secret".into()),
         };
-        OLD_SERVICES_MAP.insert(deps.as_mut().storage, &key, &old).unwrap();
+        OLD_SERVICES_MAP
+            .insert(deps.as_mut().storage, &key, &old)
+            .unwrap();
 
         // Run migrate
         let resp = migrate(deps.as_mut(), mock_env(), MigrateMsg::Migrate {}).unwrap();
@@ -2717,6 +3440,150 @@ mod tests {
         assert_eq!(new.password_hash, None);
     }
 
+    #[test]
+    fn migrate_initializes_hw_register_whitelist() {
+        use crate::contract::migrate;
+        use crate::msg::MigrateMsg;
+        use crate::state::{HwRegisterPair, HW_REGISTERS_WHITELIST};
+        use cosmwasm_std::testing::{mock_dependencies, mock_env};
+
+        let mut deps = mock_dependencies();
+
+        // Ensure whitelist is empty before migration
+        assert_eq!(
+            HW_REGISTERS_WHITELIST.iter(&deps.storage).unwrap().count(),
+            0,
+            "whitelist should be empty before migration"
+        );
+
+        // Run migrate
+        let resp = migrate(deps.as_mut(), mock_env(), MigrateMsg::Migrate {}).unwrap();
+
+        // Check that migration succeeded
+        assert!(
+            resp.attributes
+                .iter()
+                .any(|a| a.key == "action" && a.value == "migrate"),
+            "migration response must contain 'action=migrate' attribute"
+        );
+
+        // Check that hw_registers_added attribute exists and is correct
+        let added_attr = resp
+            .attributes
+            .iter()
+            .find(|a| a.key == "hw_registers_added")
+            .expect("migration response must contain 'hw_registers_added' attribute");
+        assert_eq!(added_attr.value, "12", "should have added 12 pairs");
+
+        // Verify all expected pairs are in the whitelist
+        let expected_pairs = vec![
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1039e62bcd734341c85d7584bb37781e7a7a2949077b2d909391821ee464b91abd35f8dd2afeec7984f3979a61361f2d"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1d098a879946c2a8d0379ed78989958a432291d8adae8da0472b6dbb0d1eca49d306281f48b55ecd4a90c267c6fe64a8"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "2709012eccc10afb618d90f4e2849de97ede129e27b3f53b4465f71852af9e1a52583e931f340ce9ebfa06be3c3feb48"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "5814602c6329237ab8ab42caba02bb39a4e69723ae19b062429a95f5bec6715217ae66b431e480bc877eb4f3415332b5"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "660eb1c0ce5b816b45ad7d6b49d1e9c2fcd1e14e08ef77faa7b0e9f1d180da593231adae01081799a0c700eb6ab350e7"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e314df50e8cc934afb28ceb6c96987a04ffea8180037f0d8e12b9690c0d6d34131ecacfd752334d70a40aefce572259"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e45e7ad1e74c515a5cf2ba4372465f5670123c34452c339e7fc67418d628401c4a151481e57155500b8d5668ee1c2de"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "dcb0a56bede1420cb4e1eb0b6a55d5236a3b46850fb8148007b3c186df333d02ce31b8445137919e3b4752f597e1d37d"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "09d747e568e012bb560b37604e25f1a83988037d8286e81bb97e46fb31ec4d35edf9e23236ae573265417e7ed2f89b99"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "659f42c47b5a08d18309f1a458c89b230e5a7720ddfd293e2807902781920d28039bc298f3d088fc8e0f894a07d374fc"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "671800f0b5fefa5ca79b63bde0ee0e55f38944cedfa69282ac014a9fc5f6a4a19b0cdfe33661012b3390d2aecb8e486a"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "8cf0b4047ce95aa84e38049ff7c959b1cc062a50cea4dee141e6cdea8d59c59c78c55a5ad50fef025b7009b68e01fca9"),
+        ];
+
+        for (mr_td, rtmr0) in expected_pairs {
+            let hw_pair = HwRegisterPair {
+                mr_td: mr_td.to_string(),
+                rtmr0: rtmr0.to_string(),
+            };
+            assert!(
+                HW_REGISTERS_WHITELIST.contains(&deps.storage, &hw_pair),
+                "whitelist should contain pair: mr_td={}, rtmr0={}",
+                mr_td,
+                rtmr0
+            );
+        }
+
+        // Verify the count matches expected
+        assert_eq!(
+            HW_REGISTERS_WHITELIST.iter(&deps.storage).unwrap().count(),
+            12,
+            "whitelist should contain exactly 12 pairs"
+        );
+
+        // Test idempotency - running migration again should not add duplicates
+        let resp2 = migrate(deps.as_mut(), mock_env(), MigrateMsg::Migrate {}).unwrap();
+        let added_attr2 = resp2
+            .attributes
+            .iter()
+            .find(|a| a.key == "hw_registers_added")
+            .expect("second migration response must contain 'hw_registers_added' attribute");
+        assert_eq!(
+            added_attr2.value, "0",
+            "should not add duplicates on second migration"
+        );
+
+        // Count should still be 12
+        assert_eq!(
+            HW_REGISTERS_WHITELIST.iter(&deps.storage).unwrap().count(),
+            12,
+            "whitelist should still contain exactly 12 pairs after second migration"
+        );
+    }
+
+    #[test]
+    fn query_hw_register_whitelist_returns_all_pairs() {
+        use crate::contract::{migrate, query};
+        use crate::msg::{HwRegistersWhitelistResponse, MigrateMsg, QueryMsg};
+        use cosmwasm_std::from_binary;
+        use cosmwasm_std::testing::{mock_dependencies, mock_env};
+
+        let mut deps = mock_dependencies();
+
+        // Run migrate to populate whitelist
+        migrate(deps.as_mut(), mock_env(), MigrateMsg::Migrate {}).unwrap();
+
+        // Query the whitelist
+        let query_msg = QueryMsg::GetAllHwRegisters {};
+        let response = query(deps.as_ref(), mock_env(), query_msg).unwrap();
+        let whitelist_response: HwRegistersWhitelistResponse = from_binary(&response).unwrap();
+
+        // Verify all pairs are returned
+        assert_eq!(
+            whitelist_response.pairs.len(),
+            12,
+            "query should return all 12 pairs"
+        );
+
+        // Verify the pairs match what we expect
+        let expected_pairs = vec![
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1039e62bcd734341c85d7584bb37781e7a7a2949077b2d909391821ee464b91abd35f8dd2afeec7984f3979a61361f2d"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "1d098a879946c2a8d0379ed78989958a432291d8adae8da0472b6dbb0d1eca49d306281f48b55ecd4a90c267c6fe64a8"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "2709012eccc10afb618d90f4e2849de97ede129e27b3f53b4465f71852af9e1a52583e931f340ce9ebfa06be3c3feb48"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "5814602c6329237ab8ab42caba02bb39a4e69723ae19b062429a95f5bec6715217ae66b431e480bc877eb4f3415332b5"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "660eb1c0ce5b816b45ad7d6b49d1e9c2fcd1e14e08ef77faa7b0e9f1d180da593231adae01081799a0c700eb6ab350e7"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e314df50e8cc934afb28ceb6c96987a04ffea8180037f0d8e12b9690c0d6d34131ecacfd752334d70a40aefce572259"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "9e45e7ad1e74c515a5cf2ba4372465f5670123c34452c339e7fc67418d628401c4a151481e57155500b8d5668ee1c2de"),
+            ("1e305ac8284517f73ada985bfc9fded48b23ed091ba8149678bb10207fb470c7903d7a8ddffa5a7be2a60e349bb75b6e", "dcb0a56bede1420cb4e1eb0b6a55d5236a3b46850fb8148007b3c186df333d02ce31b8445137919e3b4752f597e1d37d"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "09d747e568e012bb560b37604e25f1a83988037d8286e81bb97e46fb31ec4d35edf9e23236ae573265417e7ed2f89b99"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "659f42c47b5a08d18309f1a458c89b230e5a7720ddfd293e2807902781920d28039bc298f3d088fc8e0f894a07d374fc"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "671800f0b5fefa5ca79b63bde0ee0e55f38944cedfa69282ac014a9fc5f6a4a19b0cdfe33661012b3390d2aecb8e486a"),
+            ("ba87a347454466680bfd267446df89d8117c04ea9f28234dd3d84e1a8a957d5adaf02d4aa88433b559fb13bd40f0109e", "8cf0b4047ce95aa84e38049ff7c959b1cc062a50cea4dee141e6cdea8d59c59c78c55a5ad50fef025b7009b68e01fca9"),
+        ];
+
+        for (mr_td, rtmr0) in expected_pairs {
+            assert!(
+                whitelist_response
+                    .pairs
+                    .iter()
+                    .any(|p| p.mr_td == mr_td && p.rtmr0 == rtmr0),
+                "query result should contain pair: mr_td={}, rtmr0={}",
+                mr_td,
+                rtmr0
+            );
+        }
+    }
+
     // ---- helpers for passworded tests ----
     fn sha256_hex(s: &str) -> String {
         use sha2::{Digest, Sha256};
@@ -2734,14 +3601,20 @@ mod tests {
         let mut quote = vec![0u8; quote_len];
 
         // version = 4 (u16 LE)
-        quote[0] = 4; quote[1] = 0;
+        quote[0] = 4;
+        quote[1] = 0;
         // tee_type = 0x81 (u32 LE)
-        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
 
         // report_data tail (64 bytes at end of quote)
         let rd_off = quote_len - 64;
         // 32-byte "other" pubkey, all ones
-        for i in rd_off..(rd_off + 32) { quote[i] = 1; }
+        for i in rd_off..(rd_off + 32) {
+            quote[i] = 1;
+        }
         // put vm_uid (16 bytes) right after pubkey
         quote[rd_off + 32..rd_off + 48].copy_from_slice(vm_uid);
         quote
@@ -2764,8 +3637,9 @@ mod tests {
                 service_id: "svc_pwd".into(),
                 name: "Protected".into(),
                 password_hash: Some(pwd_hash),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Add a permissive filter (all None => matches any valid quote)
         execute(
@@ -2775,15 +3649,24 @@ mod tests {
             ExecuteMsg::AddImageToService {
                 service_id: "svc_pwd".into(),
                 image_filter: MsgImageFilter {
-                    mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None,
-                    mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
                     vm_uid: None,
                 },
                 description: "any".into(),
                 timestamp: None,
-            }
-        ).unwrap();
-        
+            },
+        )
+        .unwrap();
+
         // Add hardware registers to whitelist
         execute(
             deps.as_mut(),
@@ -2795,12 +3678,15 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build a minimal valid quote/collateral
         let mut quote = vec![0u8; std::mem::size_of::<tdx_quote_t>()];
-        quote[0] = 4; quote[1] = 0;      // version
-        quote[4] = 129; quote[5] = 0;    // tee_type
+        quote[0] = 4;
+        quote[1] = 0; // version
+        quote[4] = 129;
+        quote[5] = 0; // tee_type
         let collateral = vec![0u8; 4];
 
         // 1) No password -> "Password required"
@@ -2812,8 +3698,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: None,
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
         // 2) Wrong password -> "Password mismatch"
@@ -2825,8 +3712,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: Some("wrong".into()),
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password mismatch");
 
         // 3) Correct password -> success
@@ -2838,8 +3726,9 @@ mod tests {
                 quote,
                 collateral,
                 password: Some(pwd_plain.into()),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
         let resp: SecretKeyResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secret_key.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
@@ -2862,8 +3751,9 @@ mod tests {
                 service_id: "svc_env_pwd".into(),
                 name: "ProtectedENV".into(),
                 password_hash: Some(pwd_hash),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Add permissive filter
         execute(
@@ -2873,15 +3763,24 @@ mod tests {
             ExecuteMsg::AddImageToService {
                 service_id: "svc_env_pwd".into(),
                 image_filter: MsgImageFilter {
-                    mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None,
-                    mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
                     vm_uid: None,
                 },
                 description: "".into(),
                 timestamp: None,
-            }
-        ).unwrap();
-        
+            },
+        )
+        .unwrap();
+
         // Add hardware registers to whitelist
         execute(
             deps.as_mut(),
@@ -2893,7 +3792,8 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Store env secret at service level
         execute(
@@ -2903,13 +3803,16 @@ mod tests {
             ExecuteMsg::AddEnvByService {
                 service_id: "svc_env_pwd".into(),
                 secrets_plaintext: "ENV=1".into(),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
 
         // Dummy quote
         let mut quote = vec![0u8; std::mem::size_of::<tdx_quote_t>()];
-        quote[0] = 4; quote[1] = 0;      // version
-        quote[4] = 129; quote[5] = 0;    // tee_type
+        quote[0] = 4;
+        quote[1] = 0; // version
+        quote[4] = 129;
+        quote[5] = 0; // tee_type
         let collateral = vec![0u8; 4];
 
         // No password -> required
@@ -2921,8 +3824,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: None,
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
         // Wrong -> mismatch
@@ -2934,8 +3838,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: Some("nope".into()),
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password mismatch");
 
         // Correct -> success
@@ -2947,8 +3852,9 @@ mod tests {
                 quote,
                 collateral,
                 password: Some(pwd_plain.into()),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
         let resp: EnvSecretResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
@@ -2975,14 +3881,23 @@ mod tests {
             ExecuteMsg::AddSecretKeyByImage {
                 image_filter: MsgImageFilter {
                     // Store permissive filter; it will match the quote
-                    mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None,
-                    mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
                     vm_uid: Some(vm_uid.to_vec()),
                 },
                 password_hash: Some(pwd_hash),
-            }
-        ).unwrap();
-        
+            },
+        )
+        .unwrap();
+
         // Add hardware registers to whitelist
         execute(
             deps.as_mut(),
@@ -2994,7 +3909,8 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // 1) No password -> required
         let err = query(
@@ -3004,8 +3920,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: None,
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
         // 2) Wrong -> mismatch
@@ -3016,8 +3933,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: Some("bad".into()),
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password mismatch");
 
         // 3) Correct -> success
@@ -3028,8 +3946,9 @@ mod tests {
                 quote,
                 collateral,
                 password: Some(pwd_plain.into()),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
         let resp: SecretKeyResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secret_key.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
@@ -3054,15 +3973,24 @@ mod tests {
             admin.clone(),
             ExecuteMsg::AddEnvByImage {
                 image_filter: MsgImageFilter {
-                    mr_seam: None, mr_signer_seam: None, mr_td: None, mr_config_id: None,
-                    mr_owner: None, mr_config: None, rtmr0: None, rtmr1: None, rtmr2: None, rtmr3: None,
+                    mr_seam: None,
+                    mr_signer_seam: None,
+                    mr_td: None,
+                    mr_config_id: None,
+                    mr_owner: None,
+                    mr_config: None,
+                    rtmr0: None,
+                    rtmr1: None,
+                    rtmr2: None,
+                    rtmr3: None,
                     vm_uid: Some(vm_uid.to_vec()),
                 },
                 secrets_plaintext: "ENV=VM".into(),
                 password_hash: Some(pwd_hash),
-            }
-        ).unwrap();
-        
+            },
+        )
+        .unwrap();
+
         // Add hardware registers to whitelist
         execute(
             deps.as_mut(),
@@ -3074,7 +4002,8 @@ mod tests {
                     rtmr0: hex::encode(&[0u8; 48]),
                 }],
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // 1) No password -> required
         let err = query(
@@ -3084,8 +4013,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: None,
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
         // 2) Wrong -> mismatch
@@ -3096,8 +4026,9 @@ mod tests {
                 quote: quote.clone(),
                 collateral: collateral.clone(),
                 password: Some("no".into()),
-            }
-        ).unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password mismatch");
 
         // 3) Correct -> success
@@ -3108,8 +4039,9 @@ mod tests {
                 quote,
                 collateral,
                 password: Some(pwd_plain.into()),
-            }
-        ).unwrap();
+            },
+        )
+        .unwrap();
         let resp: EnvSecretResponse = from_binary(&bin).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
         assert!(!resp.encryption_pub_key.is_empty());
@@ -3143,7 +4075,10 @@ mod tests {
             .collect();
         let formatted_body = chunks.join("\n");
 
-        let pem_str = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", formatted_body);
+        let pem_str = format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+            formatted_body
+        );
         // Re-encode the whole PEM string to Base64 as the contract expects B64-PEM-String
         STANDARD.encode(pem_str)
     }
@@ -3164,7 +4099,8 @@ mod tests {
                 name: "AMD Service".to_string(),
                 password_hash: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // 2. Add Filter
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
@@ -3181,11 +4117,16 @@ mod tests {
                 description: "Initial AMD Filter".to_string(),
                 timestamp: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // 3. List Services (Verify isolation from TDX maps)
         let tdx_list = query_services(deps.as_ref()).unwrap();
-        assert_eq!(tdx_list.len(), 0, "AMD service should not appear in TDX list");
+        assert_eq!(
+            tdx_list.len(),
+            0,
+            "AMD service should not appear in TDX list"
+        );
 
         let amd_list = query_amd_services(deps.as_ref()).unwrap();
         assert_eq!(amd_list.len(), 1);
@@ -3195,7 +4136,10 @@ mod tests {
         let filters = query_amd_image_filters(deps.as_ref(), "amd-svc-1".to_string()).unwrap();
         assert_eq!(filters.filters.len(), 1);
         assert_eq!(filters.filters[0].description, "Initial AMD Filter");
-        assert_eq!(filters.filters[0].measurement, Some(EXPECTED_AMD_MEASUREMENT_HEX.to_string()));
+        assert_eq!(
+            filters.filters[0].measurement,
+            Some(EXPECTED_AMD_MEASUREMENT_HEX.to_string())
+        );
     }
 
     #[test]
@@ -3204,28 +4148,51 @@ mod tests {
         let admin = mock_info("admin", &[]);
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
 
-        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::CreateAmdService {
-            service_id: "amd-svc-key".to_string(), name: "Key Service".to_string(), password_hash: None,
-        }).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: "amd-svc-key".to_string(),
+                name: "Key Service".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
-        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdImageToService {
-            service_id: "amd-svc-key".to_string(),
-            image_filter: AmdMsgImageFilter { measurement: Some(measurement), vm_uid: None },
-            description: "Valid Filter".to_string(), timestamp: None,
-        }).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: "amd-svc-key".to_string(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement),
+                    vm_uid: None,
+                },
+                description: "Valid Filter".to_string(),
+                timestamp: None,
+            },
+        )
+        .unwrap();
 
         // Pass real certs converted to PEM
         let ask_pem = make_pem(GENOA_ASK_DER_B64);
         let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
 
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
-            service_id: "amd-svc-key".to_string(),
-            report: VALID_AMD_REPORT_B64.to_string(),
-            ask_pem,
-            vcek_pem,
-            password: None,
-        }).unwrap();
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-svc-key".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                ask_pem,
+                vcek_pem,
+                password: None,
+            },
+        )
+        .unwrap();
 
         let key_resp: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!key_resp.encrypted_secret_key.is_empty());
@@ -3240,19 +4207,35 @@ mod tests {
         let vm_uid = vec![0u8; 16];
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
 
-        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdEnvByImage {
-            image_filter: AmdMsgImageFilter { measurement: Some(measurement.clone()), vm_uid: Some(vm_uid.clone()) },
-            secrets_plaintext: "AMD_ENV_VAR=SUCCESS".to_string(), password_hash: None,
-        }).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdEnvByImage {
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement.clone()),
+                    vm_uid: Some(vm_uid.clone()),
+                },
+                secrets_plaintext: "AMD_ENV_VAR=SUCCESS".to_string(),
+                password_hash: None,
+            },
+        )
+        .unwrap();
 
         let ask_pem = make_pem(GENOA_ASK_DER_B64);
         let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
 
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetEnvByImageAmd {
-            report: VALID_AMD_REPORT_B64.to_string(),
-            ask_pem, vcek_pem,
-            password: None,
-        }).unwrap();
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetEnvByImageAmd {
+                report: VALID_AMD_REPORT_B64.to_string(),
+                ask_pem,
+                vcek_pem,
+                password: None,
+            },
+        )
+        .unwrap();
 
         let env_resp: EnvSecretResponse = from_binary(&res).unwrap();
         assert!(!env_resp.encrypted_secrets_plaintext.is_empty());
@@ -3267,36 +4250,66 @@ mod tests {
         let pwd_plain = "secret-amd";
         let pwd_hash = sha256_hex(pwd_plain);
 
-        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::CreateAmdService {
-            service_id: "amd-pwd".to_string(), name: "Secure AMD".to_string(), password_hash: Some(pwd_hash),
-        }).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::CreateAmdService {
+                service_id: "amd-pwd".to_string(),
+                name: "Secure AMD".to_string(),
+                password_hash: Some(pwd_hash),
+            },
+        )
+        .unwrap();
 
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
-        execute(deps.as_mut(), mock_env(), admin.clone(), ExecuteMsg::AddAmdImageToService {
-            service_id: "amd-pwd".to_string(),
-            image_filter: AmdMsgImageFilter { measurement: Some(measurement), vm_uid: None },
-            description: "desc".to_string(), timestamp: None,
-        }).unwrap();
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            admin.clone(),
+            ExecuteMsg::AddAmdImageToService {
+                service_id: "amd-pwd".to_string(),
+                image_filter: AmdMsgImageFilter {
+                    measurement: Some(measurement),
+                    vm_uid: None,
+                },
+                description: "desc".to_string(),
+                timestamp: None,
+            },
+        )
+        .unwrap();
 
         let ask_pem = make_pem(GENOA_ASK_DER_B64);
         let vcek_pem = make_pem(GENOA_VCEK_HOST1_DER_B64);
 
         // Fail
-        let err = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
-            service_id: "amd-pwd".to_string(),
-            report: VALID_AMD_REPORT_B64.to_string(),
-            ask_pem: ask_pem.clone(), vcek_pem: vcek_pem.clone(),
-            password: None,
-        }).unwrap_err();
+        let err = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-pwd".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                ask_pem: ask_pem.clone(),
+                vcek_pem: vcek_pem.clone(),
+                password: None,
+            },
+        )
+        .unwrap_err();
         assert_eq!(err.to_string(), "Generic error: Password required");
 
         // Success
-        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetSecretKeyAmd {
-            service_id: "amd-pwd".to_string(),
-            report: VALID_AMD_REPORT_B64.to_string(),
-            ask_pem, vcek_pem,
-            password: Some(pwd_plain.to_string()),
-        }).unwrap();
+        let res = query(
+            deps.as_ref(),
+            mock_env(),
+            QueryMsg::GetSecretKeyAmd {
+                service_id: "amd-pwd".to_string(),
+                report: VALID_AMD_REPORT_B64.to_string(),
+                ask_pem,
+                vcek_pem,
+                password: Some(pwd_plain.to_string()),
+            },
+        )
+        .unwrap();
         let resp: SecretKeyResponse = from_binary(&res).unwrap();
         assert!(!resp.encrypted_secret_key.is_empty());
     }
@@ -3318,7 +4331,8 @@ mod tests {
                 name: "Env Service".to_string(),
                 password_hash: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Add filter so the report matches
         let measurement = hex::decode(EXPECTED_AMD_MEASUREMENT_HEX).unwrap();
@@ -3335,7 +4349,8 @@ mod tests {
                 description: "filter".to_string(),
                 timestamp: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Add Service Env
         execute(
@@ -3346,7 +4361,8 @@ mod tests {
                 service_id: service_id.clone(),
                 secrets_plaintext: "SERVICE_SECRET=123".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Prepare certs
         let ask_pem = make_pem(GENOA_ASK_DER_B64);
@@ -3363,7 +4379,8 @@ mod tests {
                 vcek_pem,
                 password: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         let resp: EnvSecretResponse = from_binary(&res).unwrap();
         assert!(!resp.encrypted_secrets_plaintext.is_empty());
@@ -3373,7 +4390,7 @@ mod tests {
     fn test_hw_registers_whitelist_add_and_query() {
         let mut deps = mock_dependencies();
         let admin = mock_info("admin", &[]);
-        
+
         // Initialize contract
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
 
@@ -3394,15 +4411,17 @@ mod tests {
             pairs: pairs.clone(),
         };
         let res = execute(deps.as_mut(), mock_env(), admin.clone(), add_msg).unwrap();
-        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "add_hw_registers_to_whitelist"));
-        assert!(res.attributes.iter().any(|a| a.key == "count" && a.value == "2"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|a| a.key == "action" && a.value == "add_hw_registers_to_whitelist"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|a| a.key == "count" && a.value == "2"));
 
         // Query all pairs
-        let query_res = query(
-            deps.as_ref(),
-            mock_env(),
-            QueryMsg::GetAllHwRegisters {},
-        ).unwrap();
+        let query_res = query(deps.as_ref(), mock_env(), QueryMsg::GetAllHwRegisters {}).unwrap();
         let all_pairs: HwRegistersWhitelistResponse = from_binary(&query_res).unwrap();
         assert_eq!(all_pairs.pairs.len(), 2);
 
@@ -3414,7 +4433,8 @@ mod tests {
                 mr_td: "aabbccdd".to_string(),
                 rtmr0: "11223344".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         let check_resp: HwRegisterPairCheckResponse = from_binary(&check_res).unwrap();
         assert!(check_resp.exists);
 
@@ -3426,7 +4446,8 @@ mod tests {
                 mr_td: "nonexistent".to_string(),
                 rtmr0: "notfound".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         let check_resp2: HwRegisterPairCheckResponse = from_binary(&check_res2).unwrap();
         assert!(!check_resp2.exists);
     }
@@ -3435,7 +4456,7 @@ mod tests {
     fn test_hw_registers_whitelist_remove() {
         let mut deps = mock_dependencies();
         let admin = mock_info("admin", &[]);
-        
+
         // Initialize contract
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
 
@@ -3455,8 +4476,11 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::AddHwRegistersToWhitelist { pairs: pairs.clone() },
-        ).unwrap();
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: pairs.clone(),
+            },
+        )
+        .unwrap();
 
         // Remove one pair
         let remove_pairs = vec![pairs[0].clone()];
@@ -3464,8 +4488,14 @@ mod tests {
             pairs: remove_pairs,
         };
         let res = execute(deps.as_mut(), mock_env(), admin.clone(), remove_msg).unwrap();
-        assert!(res.attributes.iter().any(|a| a.key == "action" && a.value == "remove_hw_registers_from_whitelist"));
-        assert!(res.attributes.iter().any(|a| a.key == "count" && a.value == "1"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|a| a.key == "action" && a.value == "remove_hw_registers_from_whitelist"));
+        assert!(res
+            .attributes
+            .iter()
+            .any(|a| a.key == "count" && a.value == "1"));
 
         // Check that removed pair doesn't exist
         let check_res = query(
@@ -3475,7 +4505,8 @@ mod tests {
                 mr_td: "aabbccdd".to_string(),
                 rtmr0: "11223344".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         let check_resp: HwRegisterPairCheckResponse = from_binary(&check_res).unwrap();
         assert!(!check_resp.exists);
 
@@ -3487,7 +4518,8 @@ mod tests {
                 mr_td: "eeff0011".to_string(),
                 rtmr0: "55667788".to_string(),
             },
-        ).unwrap();
+        )
+        .unwrap();
         let check_resp2: HwRegisterPairCheckResponse = from_binary(&check_res2).unwrap();
         assert!(check_resp2.exists);
     }
@@ -3497,16 +4529,14 @@ mod tests {
         let mut deps = mock_dependencies();
         let admin = mock_info("admin", &[]);
         let non_admin = mock_info("user", &[]);
-        
+
         // Initialize contract
         instantiate(deps.as_mut(), mock_env(), admin.clone(), InstantiateMsg {}).unwrap();
 
-        let pairs = vec![
-            HwRegisterPairMsg {
-                mr_td: "aabbccdd".to_string(),
-                rtmr0: "11223344".to_string(),
-            },
-        ];
+        let pairs = vec![HwRegisterPairMsg {
+            mr_td: "aabbccdd".to_string(),
+            rtmr0: "11223344".to_string(),
+        }];
 
         // Try to add as non-admin (should fail)
         let add_msg = ExecuteMsg::AddHwRegistersToWhitelist {
@@ -3521,8 +4551,11 @@ mod tests {
             deps.as_mut(),
             mock_env(),
             admin.clone(),
-            ExecuteMsg::AddHwRegistersToWhitelist { pairs: pairs.clone() },
-        ).unwrap();
+            ExecuteMsg::AddHwRegistersToWhitelist {
+                pairs: pairs.clone(),
+            },
+        )
+        .unwrap();
 
         // Try to remove as non-admin (should fail)
         let remove_msg = ExecuteMsg::RemoveHwRegistersFromWhitelist {
@@ -3538,18 +4571,24 @@ mod tests {
         // Test that TDX queries fail when mr_td/rtmr0 pair is not in whitelist
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
-        
-        let create_msg = ExecuteMsg::CreateService { 
-            name: "TestService".to_string(), 
-            service_id: "0".to_string(), 
-            password_hash: None
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
+
+        let create_msg = ExecuteMsg::CreateService {
+            name: "TestService".to_string(),
+            service_id: "0".to_string(),
+            password_hash: None,
         };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
-        
+
         let expected_mr_td = vec![7u8; 48];
         let expected_rtmr0 = vec![9u8; 48];
-        
+
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
@@ -3563,37 +4602,44 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { 
-            service_id: "0".to_string(), 
-            image_filter, 
-            description: "TestImage".to_string(), 
-            timestamp: None 
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            image_filter,
+            description: "TestImage".to_string(),
+            timestamp: None,
         };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
-        
+
         // Build quote WITHOUT adding to whitelist
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
-        quote[0] = 4; quote[1] = 0;
-        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
-        
+        quote[0] = 4;
+        quote[1] = 0;
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
+
         let mr_td_offset = 184;
-        quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&expected_mr_td);
         let rtmr0_offset = 376;
-        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
-        
+        quote[rtmr0_offset..rtmr0_offset + 48].copy_from_slice(&expected_rtmr0);
+
         let collateral = vec![0u8; 10];
-        let get_msg = QueryMsg::GetSecretKey { 
-            service_id: "0".to_string(), 
-            quote: quote.clone(), 
-            collateral: collateral.clone(), 
-            password: None 
+        let get_msg = QueryMsg::GetSecretKey {
+            service_id: "0".to_string(),
+            quote: quote.clone(),
+            collateral: collateral.clone(),
+            password: None,
         };
-        
+
         // Should fail because pair is not in whitelist
         let res = query(deps.as_ref(), mock_env(), get_msg);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("No matching image filter"));
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("No matching image filter"));
     }
 
     #[test]
@@ -3601,26 +4647,34 @@ mod tests {
         // Test that TDX queries succeed when mr_td/rtmr0 pair IS in whitelist
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
-        
-        let create_msg = ExecuteMsg::CreateService { 
-            name: "TestService".to_string(), 
-            service_id: "0".to_string(), 
-            password_hash: None
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
+
+        let create_msg = ExecuteMsg::CreateService {
+            name: "TestService".to_string(),
+            service_id: "0".to_string(),
+            password_hash: None,
         };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), create_msg).unwrap();
-        
+
         let expected_mr_td = vec![7u8; 48];
         let expected_rtmr0 = vec![9u8; 48];
-        
+
         // Add to whitelist
         let hw_pair = HwRegisterPairMsg {
             mr_td: hex::encode(&expected_mr_td),
             rtmr0: hex::encode(&expected_rtmr0),
         };
-        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist { pairs: vec![hw_pair] };
+        let whitelist_msg = ExecuteMsg::AddHwRegistersToWhitelist {
+            pairs: vec![hw_pair],
+        };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), whitelist_msg).unwrap();
-        
+
         let image_filter = MsgImageFilter {
             mr_seam: None,
             mr_signer_seam: None,
@@ -3634,33 +4688,37 @@ mod tests {
             rtmr3: None,
             vm_uid: None,
         };
-        let add_msg = ExecuteMsg::AddImageToService { 
-            service_id: "0".to_string(), 
-            image_filter, 
-            description: "TestImage".to_string(), 
-            timestamp: None 
+        let add_msg = ExecuteMsg::AddImageToService {
+            service_id: "0".to_string(),
+            image_filter,
+            description: "TestImage".to_string(),
+            timestamp: None,
         };
         execute(deps.as_mut(), mock_env(), admin_info.clone(), add_msg).unwrap();
-        
+
         // Build quote
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
-        quote[0] = 4; quote[1] = 0;
-        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
-        
+        quote[0] = 4;
+        quote[1] = 0;
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
+
         let mr_td_offset = 184;
-        quote[mr_td_offset..mr_td_offset+48].copy_from_slice(&expected_mr_td);
+        quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&expected_mr_td);
         let rtmr0_offset = 376;
-        quote[rtmr0_offset..rtmr0_offset+48].copy_from_slice(&expected_rtmr0);
-        
+        quote[rtmr0_offset..rtmr0_offset + 48].copy_from_slice(&expected_rtmr0);
+
         let collateral = vec![0u8; 10];
-        let get_msg = QueryMsg::GetSecretKey { 
-            service_id: "0".to_string(), 
-            quote: quote.clone(), 
-            collateral: collateral.clone(), 
-            password: None 
+        let get_msg = QueryMsg::GetSecretKey {
+            service_id: "0".to_string(),
+            quote: quote.clone(),
+            collateral: collateral.clone(),
+            password: None,
         };
-        
+
         // Should succeed because pair is in whitelist
         let res = query(deps.as_ref(), mock_env(), get_msg);
         assert!(res.is_ok());
@@ -3676,11 +4734,17 @@ mod tests {
 
         let mut deps = mock_dependencies();
         let admin_info = mock_info("admin", &[]);
-        instantiate(deps.as_mut(), mock_env(), admin_info.clone(), InstantiateMsg {}).unwrap();
+        instantiate(
+            deps.as_mut(),
+            mock_env(),
+            admin_info.clone(),
+            InstantiateMsg {},
+        )
+        .unwrap();
 
         let mr_td_bytes = vec![99u8; 48];
         let rtmr0_bytes = vec![88u8; 48];
-        
+
         // Add env secret but DON'T add to whitelist
         let image_filter = MsgImageFilter {
             mr_seam: None,
@@ -3702,15 +4766,20 @@ mod tests {
             ExecuteMsg::AddEnvByImage {
                 image_filter: image_filter.clone(),
                 secrets_plaintext: "secret".to_string(),
-                password_hash: None
+                password_hash: None,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Build quote
         let quote_len = mem::size_of::<tdx_quote_t>();
         let mut quote = vec![0u8; quote_len];
-        quote[0] = 4; quote[1] = 0;
-        quote[4] = 129; quote[5] = 0; quote[6] = 0; quote[7] = 0;
+        quote[0] = 4;
+        quote[1] = 0;
+        quote[4] = 129;
+        quote[5] = 0;
+        quote[6] = 0;
+        quote[7] = 0;
 
         let mr_td_offset = 184;
         quote[mr_td_offset..mr_td_offset + 48].copy_from_slice(&mr_td_bytes);
@@ -3724,16 +4793,22 @@ mod tests {
         quote[r3_off..r3_off + 48].copy_from_slice(&[40u8; 48]);
 
         let rd_off = quote_len - 64;
-        for i in rd_off..(rd_off + 32) { quote[i] = 1; }
+        for i in rd_off..(rd_off + 32) {
+            quote[i] = 1;
+        }
         quote[rd_off + 32..rd_off + 48].copy_from_slice(&vm_uid_bytes);
 
         let collateral = vec![0u8; 10];
         let res = query(
             deps.as_ref(),
             mock_env(),
-            QueryMsg::GetEnvByImage { quote, collateral, password: None}
+            QueryMsg::GetEnvByImage {
+                quote,
+                collateral,
+                password: None,
+            },
         );
-        
+
         // Should fail because not in whitelist
         assert!(res.is_err());
     }
